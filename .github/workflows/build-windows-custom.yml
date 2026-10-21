@@ -141,6 +141,9 @@ jobs:
       # + 静默安装 Vulkan SDK。它不幂等（mv/解包第二次会挂），所以用标记文件整段跳过。
       - name: Download and unpack dependencies
         run: |
+          # 子模块每次都必须拉：它们在 git 工作树里，不进依赖缓存。
+          # （否则缓存命中后会跳过 setup-windows.sh，3rdparty 全空 → asmjit/rtmidi/fusion/protobuf 编译失败）
+          git submodule -q update --init --depth=1 --jobs=8 $(awk '/path/ && !/FAudio/ && !/llvm/ && !/feralinteractive/ { print $3 }' .gitmodules)
           if [ -f .deps_ready ]; then
             echo "依赖来自缓存，跳过 setup-windows.sh"
           else
