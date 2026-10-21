@@ -1,0 +1,226 @@
+# =============================================================================
+# RPCS3 定制版 —— 仅 Windows (MSVC) 的最小 GitHub Actions workflow
+# -----------------------------------------------------------------------------
+# 用法（给非 CI 专家）：
+#   1. fork 上游 https://github.com/RPCS3/rpcs3 到自己账号（必须是 public！）
+#   2. 在自己的 fork 里新建文件： .github/workflows/build-windows-custom.yml
+#      内容 = 本文件（用网页版 "Add file -> Create new file" 直接粘贴即可，
+#      GitHub 会把它直接提交到默认分支 master）
+#   3. Actions 标签页 -> 左侧 "Build RPCS3 (custom Windows)" -> Run workflow
+#   4. 等 1.5~2.5 小时（首次），跑完后在本页底部 Artifacts 里下载
+#
+# 为什么不直接用上游 .github/workflows/rpcs3.yml：
+#   * 上游 7 个 job 定义（11 个实例：Linux×4 / Mac×2 / Windows×3 / FreeBSD×1 / 缓存清理）会全排上，白烧 4 小时
+#   * 上游 ccache 只在 refs/heads/master 上 save，fork 里跑第一次等于"永远冷启动"
+#   * 上游 deploy 步骤写了 github.repository == 'RPCS3/rpcs3'（fork 自动跳过，这没问题）
+#   本文件只保留 Windows msvc 一条线，并补了 GPLv2 对应的源码包。
+#
+# 依赖版本锁：与上游 .github/workflows/rpcs3.yml 的 Windows_Build 完全一致。
+#   上游升级 Qt/Vulkan/LLVM 后，本文件需要同步改下面 env 段（见 G4-报告.md §1.2 / §2）。
+# =============================================================================
+
+name: Build RPCS3 (custom Windows)
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '本次构建备注（只写进 job summary，可留空）'
+        required: false
+        default: ''
+  push:
+    # 只在专用分支上触发。千万别写成 master，否则每次改 workflow 都会触发一次 2 小时构建。
+    branches:
+      - custom-build
+
+# 同一分支只留一个在跑；PR 之外不自动取消，避免把跑了一半的构建掐掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # ---- 上游脚本（.ci/*.sh、Utilities/git-version-gen.cmd）依赖这 5 个变量，别删 ----
+  BUILD_REPOSITORY_NAME: ${{ github.repository }}
+  BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+  BUILD_PR_NUMBER: ${{ github.event.pull_request.number }}
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+
+jobs:
+  Windows_Build:
+    name: RPCS3 Windows (MSVC, custom)
+    # 上游用的就是这个镜像；它同时也被标记为 windows-latest（runner-images 里两者同镜像）
+    runs-on: windows-2025-vs2026
+    # 上游 Windows job 没有 timeout（默认 360 分钟）。这里显式钉死，免得异常构建烧满 6 小时。
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    env:
+      COMPILER: msvc
+      # ---- 版本锁（与上游一致，改这里就等于改依赖）----
+      QT_VER_MAIN: '6'
+      QT_VER: '6.12.0'
+      QT_VER_MSVC: 'msvc2022'
+      QT_DATE: '202609280346'
+      LLVM_VER: '22.1.8'
+      VULKAN_VER: '1.4.341.1'
+      VULKAN_SDK_SHA: 'bcf2d75aa9556889ab974858666e20b3655b6055a0db704ccb47279ff33b5bfe'
+      CCACHE_SHA: '859141059ac950e1e8cd042c66f842f26b9e3a62a1669a69fe6ba180cb58bbdf'
+      # ---- ccache ----
+      CCACHE_BIN_DIR: 'C:\ccache_bin'
+      CCACHE_DIR: 'C:\ccache'
+      CCACHE_INODECACHE: 'true'
+      CCACHE_SLOPPINESS: 'time_macros'
+      # 注意：GitHub 单仓库缓存上限 10 GiB，还要放依赖缓存，别贪心设 7G
+      CCACHE_MAXSIZE: '4G'
+      DEPS_CACHE_DIR: ./dependency_cache
+      # 跳过 rpcs3_test（省掉 gtest 编译；上游 Windows_Build 也是这么干的）
+      SKIP_RPCS3_TEST: 'true'
+
+    steps:
+      # ---------------------------------------------------------------- 1. 源码
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # .ci/setup-windows-ci-vars.sh 要用 git rev-list --count HEAD，必须是完整历史
+          fetch-depth: 0
+
+      # ---------------------------------------------------------------- 2. 缓存
+      # 依赖缓存：打包好的 7z（省 640 MB 下载）+ 已解包的 Qt / Vulkan SDK + 就绪标记。
+      # 命中时下面 "Download and unpack dependencies" 会整段跳过（省 8~12 分钟）。
+      - name: Cache dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.DEPS_CACHE_DIR }}
+            C:\Qt
+            C:\VulkanSDK
+            C:\ccache_bin
+            .deps_ready
+          key: deps-${{ runner.os }}-${{ env.COMPILER }}-qt${{ env.QT_VER }}-vk${{ env.VULKAN_VER }}-llvm${{ env.LLVM_VER }}-${{ env.VULKAN_SDK_SHA }}
+
+      # ccache：key 带 run_id，每次跑都会新存一份；restore-keys 前缀匹配最近一份。
+      # 超过 10 GiB 时 GitHub 按 LRU 淘汰，属正常现象。
+      - name: Cache ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ env.COMPILER }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.COMPILER }}-
+
+      # ---------------------------------------------------------------- 3. 环境
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@v4
+
+      - name: Restore NuGet packages
+        run: nuget restore rpcs3.sln
+
+      - name: Setup env
+        shell: pwsh
+        run: |
+          echo "QTDIR=C:\Qt\${{ env.QT_VER }}\${{ env.QT_VER_MSVC }}_64" >> ${{ github.env }}
+          echo "VULKAN_SDK=C:\VulkanSDK\${{ env.VULKAN_VER }}" >> ${{ github.env }}
+
+      # ---------------------------------------------------------------- 4. 依赖
+      # 上游脚本 .ci/setup-windows.sh: 拉 25 个子模块 + 下载&校验&解包 Qt/LLVM/ccache
+      # + 静默安装 Vulkan SDK。它不幂等（mv/解包第二次会挂），所以用标记文件整段跳过。
+      - name: Download and unpack dependencies
+        run: |
+          if [ -f .deps_ready ]; then
+            echo "依赖来自缓存，跳过 setup-windows.sh"
+          else
+            .ci/setup-windows.sh
+            touch .deps_ready
+          fi
+          .ci/setup-windows-ci-vars.sh win64 msvc
+
+      # 把 .ci/ci-vars.env 里的 BUILD / BUILD_RAW / AVVER 提升为后续步骤可见的环境变量
+      - name: Export variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ -z "$key" || "$key" =~ ^# ]] && continue
+            echo "$key=$val" >> "${{ github.env }}"
+          done < .ci/ci-vars.env
+          echo "artifact 名: ${BUILD_RAW}"
+
+      # ---------------------------------------------------------------- 5. 编译
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@main
+
+      # 与上游逐字一致。ci_only.targets 只是关 PDB + 开 LTCG。
+      # 真烧时间的部分：emucore(~450 cpp) + rpcs3(~1400 cpp) + 25 个 3rdparty 子工程。
+      - name: Compile RPCS3
+        shell: pwsh
+        run: msbuild rpcs3.sln /p:Configuration=Release /v:minimal /p:Platform=x64 /p:PreferredToolArchitecture=x64 /p:CLToolPath=${{ env.CCACHE_BIN_DIR }} /p:UseMultiToolTask=true /p:CustomAfterMicrosoftCommonTargets="${{ github.workspace }}\buildfiles\msvc\ci_only.targets"
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats --verbose || true
+
+      # ---------------------------------------------------------------- 6. 打包
+      # 上游 .ci/deploy-windows.sh：删 exp/lib/pdb/vc_redist，拉兼容性库+手柄库+翻译，
+      # 7z a -m0=LZMA2 -mx9 -> bin/* 打成 rpcs3-v...-win64_msvc.7z，并生成 .sha256
+      - name: Pack up build artifacts
+        run: |
+          mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          .ci/deploy-windows.sh
+
+      # ---------------------------------------------------------------- 7. GPLv2 合规
+      # LICENSE 是 GPLv2：分发二进制必须能拿到"对应源码"。这里把
+      #   (a) 当前 commit 的完整源码树（含我们的改动）
+      #   (b) 相对上游的补丁
+      #   (c) 子模块 commit 清单
+      # 一起塞进 artifact。git archive 不含子模块，所以额外产出 SUBMODULES.txt。
+      - name: Package corresponding source (GPLv2)
+        run: |
+          OUT="${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          PREFIX="$(basename "${BUILD_RAW}")-src"
+          git archive --format=tar.gz --prefix="${PREFIX}/" -o "${OUT}/${BUILD_RAW}-src.tar.gz" HEAD
+          git submodule status > "${OUT}/${BUILD_RAW}-SUBMODULES.txt"
+          git log -1 --format='commit=%H%nsubject=%s%ndate=%ad' > "${OUT}/${BUILD_RAW}-COMMIT.txt"
+          # 有上游 remote 就出补丁（fork 里 origin=自己，upstream=RPCS3/rpcs3）
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git fetch --no-tags --depth=1 upstream master || true
+            git diff --stat upstream/master...HEAD > "${OUT}/${BUILD_RAW}-DIFFSTAT.txt" || true
+            git diff upstream/master...HEAD > "${OUT}/${BUILD_RAW}.patch" || true
+          else
+            echo "未配置 upstream remote，跳过补丁生成（不影响产物）" \
+              > "${OUT}/${BUILD_RAW}-DIFFSTAT.txt"
+          fi
+
+      - name: Write SHA256SUMS
+        run: |
+          cd "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          sha256sum ./* > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### RPCS3 定制 Windows 构建"
+            echo ""
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- 备注: ${{ github.event.inputs.note }}"
+            echo "- 产物: \`${BUILD_RAW}\`"
+            echo ""
+            echo '```'
+            cat "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}/SHA256SUMS.txt" 2>/dev/null || echo '(无产物)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------- 8. 上传
+      # 注意 compression-level: 0 —— 里面已经是 LZMA2 的 7z，别再 zip 一遍（省 10 分钟）
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: RPCS3-Windows-custom-${{ github.run_number }}
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
