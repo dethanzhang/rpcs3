@@ -110,8 +110,11 @@ jobs:
             C:\Qt
             C:\VulkanSDK
             C:\ccache_bin
+            build/lib_ext
             .deps_ready
-          key: deps-${{ runner.os }}-${{ env.COMPILER }}-qt${{ env.QT_VER }}-vk${{ env.VULKAN_VER }}-llvm${{ env.LLVM_VER }}-${{ env.VULKAN_SDK_SHA }}
+          # v2: 加入 build/lib_ext（setup-windows.sh 把 llvmlibs 解包在这里；
+          #     之前没进缓存 → 缓存命中后 llvm/Support/*.h 缺失，编译失败）
+          key: deps-v2-${{ runner.os }}-${{ env.COMPILER }}-qt${{ env.QT_VER }}-vk${{ env.VULKAN_VER }}-llvm${{ env.LLVM_VER }}-${{ env.VULKAN_SDK_SHA }}
 
       # ccache：key 带 run_id，每次跑都会新存一份；restore-keys 前缀匹配最近一份。
       # 超过 10 GiB 时 GitHub 按 LRU 淘汰，属正常现象。
