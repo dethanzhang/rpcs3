@@ -100,9 +100,14 @@
 #include "raw_mouse_settings_dialog.h"
 #endif
 
-#if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && defined(ARCH_X64))
-#define RPCS3_UPDATE_SUPPORTED
-#endif
+// 定制版：彻底关闭内置更新器（自动检查 + 官方更新服务器）。
+// 原逻辑：Linux / macOS / Windows x64 均启用更新器。
+// 关闭后：本文件内 3 处 #ifdef RPCS3_UPDATE_SUPPORTED 分支全部编译掉
+//         （启动自动检查、signal_update_available/signal_download_additional_files 连接），
+//         启动不再联网访问 update.rpcs3.net。
+// #if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && defined(ARCH_X64))
+// #define RPCS3_UPDATE_SUPPORTED
+// #endif
 
 LOG_CHANNEL(gui_log, "GUI");
 
@@ -3560,11 +3565,10 @@ void main_window::CreateConnects()
 
 	connect(ui->updateAct, &QAction::triggered, this, [this]()
 	{
-#ifdef RPCS3_UPDATE_SUPPORTED
-		m_updater.check_for_updates(false, false, false, this);
-#else
-		QMessageBox::warning(this, tr("Auto-updater"), tr("The auto-updater isn't available for your OS currently."));
-#endif
+		// 定制版：不连官方更新服务器（update.rpcs3.net），直接打开我们自己的 Release 页。
+		// 注意：本 lambda 已整体替换掉原来的 #ifdef RPCS3_UPDATE_SUPPORTED / #else 分支，
+		//       与本文件顶部是否定义 RPCS3_UPDATE_SUPPORTED 无关。
+		QDesktopServices::openUrl(QUrl("https://github.com/dethanzhang/rpcs3/releases"));
 	});
 
 	connect(ui->downloadIntegrityDbAct, &QAction::triggered, this, [this]()

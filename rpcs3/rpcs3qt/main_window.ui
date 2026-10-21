@@ -916,7 +916,7 @@
   </action>
   <action name="updateAct">
    <property name="text">
-    <string>Check for Updates</string>
+    <string>检查定制版更新</string>
    </property>
   </action>
   <action name="downloadIntegrityDbAct">
