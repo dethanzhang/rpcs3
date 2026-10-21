@@ -232,24 +232,29 @@ namespace ps3lock
 		u8 pub[PUB_LEN] = {};        // uncompressed
 	};
 
-	static bool tpm_open_wrapping_key(NCRYPT_KEY_HANDLE& out_key, bool& created)
+	// Returns both handles: free the key first, then the provider (child before parent).
+	static bool tpm_open_wrapping_key(NCRYPT_PROV_HANDLE& prov, NCRYPT_KEY_HANDLE& out_key, bool& created)
 	{
 		created = false;
-		NCRYPT_PROV_HANDLE prov = 0;
+		prov = 0;
+		out_key = 0;
+
 		if (NCryptOpenStorageProvider(&prov, MS_PLATFORM_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS)
 		{
+			prov = 0;
 			return false;
 		}
 
 		if (NCryptOpenKey(prov, &out_key, L"rpcs3-ps3lock-wk", 0, 0) == ERROR_SUCCESS)
 		{
-			NCryptFreeObject(prov);
 			return true;
 		}
 
 		if (NCryptCreatePersistedKey(prov, &out_key, BCRYPT_RSA_ALGORITHM, L"rpcs3-ps3lock-wk", 0, 0) != ERROR_SUCCESS)
 		{
 			NCryptFreeObject(prov);
+			prov = 0;
+			out_key = 0;
 			return false;
 		}
 
@@ -260,10 +265,11 @@ namespace ps3lock
 		{
 			NCryptFreeObject(out_key);
 			NCryptFreeObject(prov);
+			prov = 0;
+			out_key = 0;
 			return false;
 		}
 
-		NCryptFreeObject(prov);
 		created = true;
 		return true;
 	}
@@ -271,23 +277,29 @@ namespace ps3lock
 	// Wrap/unwrap the small private blob: TPM (OAEP) first, DPAPI fallback.
 	static bool wrap_blob(const std::vector<u8>& in, u8& kind, std::vector<u8>& out)
 	{
+		NCRYPT_PROV_HANDLE prov = 0;
 		NCRYPT_KEY_HANDLE key = 0;
 		bool created = false;
-		if (tpm_open_wrapping_key(key, created))
+		if (tpm_open_wrapping_key(prov, key, created))
 		{
 			DWORD need = 0;
-			if (NCryptEncrypt(key, in.data(), static_cast<DWORD>(in.size()), nullptr, nullptr, 0, &need, NCRYPT_PAD_OAEP_FLAG) == ERROR_SUCCESS)
+			bool done = false;
+			if (NCryptEncrypt(key, const_cast<PBYTE>(in.data()), static_cast<DWORD>(in.size()), nullptr, nullptr, 0, &need, NCRYPT_PAD_OAEP_FLAG) == ERROR_SUCCESS)
 			{
 				out.resize(need);
-				if (NCryptEncrypt(key, in.data(), static_cast<DWORD>(in.size()), nullptr, out.data(), need, &need, NCRYPT_PAD_OAEP_FLAG) == ERROR_SUCCESS)
+				if (NCryptEncrypt(key, const_cast<PBYTE>(in.data()), static_cast<DWORD>(in.size()), nullptr, out.data(), need, &need, NCRYPT_PAD_OAEP_FLAG) == ERROR_SUCCESS)
 				{
 					out.resize(need);
-					NCryptFreeObject(key);
 					kind = 1;
-					return true;
+					done = true;
 				}
 			}
 			NCryptFreeObject(key);
+			NCryptFreeObject(prov);
+			if (done)
+			{
+				return true;
+			}
 		}
 
 		DATA_BLOB din{static_cast<DWORD>(in.size()), const_cast<BYTE*>(in.data())};
@@ -306,25 +318,28 @@ namespace ps3lock
 	{
 		if (kind == 1)
 		{
+			NCRYPT_PROV_HANDLE prov = 0;
 			NCRYPT_KEY_HANDLE key = 0;
 			bool created = false;
-			if (!tpm_open_wrapping_key(key, created))
+			if (!tpm_open_wrapping_key(prov, key, created))
 			{
 				return false;
 			}
 
 			DWORD need = 0;
-			NTSTATUS st = NCryptDecrypt(key, in.data(), static_cast<DWORD>(in.size()), nullptr, nullptr, 0, &need, NCRYPT_PAD_OAEP_FLAG);
+			NTSTATUS st = NCryptDecrypt(key, const_cast<PBYTE>(in.data()), static_cast<DWORD>(in.size()), nullptr, nullptr, 0, &need, NCRYPT_PAD_OAEP_FLAG);
 			if (st != ERROR_SUCCESS)
 			{
 				NCryptFreeObject(key);
+				NCryptFreeObject(prov);
 				ps3lock_log.error("TPM unwrap failed: %s", ncrypt_error_text(st));
 				return false;
 			}
 
 			out.resize(need);
-			st = NCryptDecrypt(key, in.data(), static_cast<DWORD>(in.size()), nullptr, out.data(), need, &need, NCRYPT_PAD_OAEP_FLAG);
+			st = NCryptDecrypt(key, const_cast<PBYTE>(in.data()), static_cast<DWORD>(in.size()), nullptr, out.data(), need, &need, NCRYPT_PAD_OAEP_FLAG);
 			NCryptFreeObject(key);
+			NCryptFreeObject(prov);
 			if (st != ERROR_SUCCESS)
 			{
 				return false;
@@ -499,7 +514,8 @@ namespace ps3lock
 		}
 
 		std::vector<u8> blob;
-		blob.insert(blob.end(), {'P','S','3','L','K','K','E','Y'});
+		static const u8 key_magic[8] = {'P','S','3','L','K','K','E','Y'};
+		blob.insert(blob.end(), key_magic, key_magic + 8);
 		blob.push_back(1);           // version
 		blob.push_back(kind);        // 1 = TPM RSA-OAEP, 2 = DPAPI
 		blob.insert(blob.end(), key.pub, key.pub + PUB_LEN);
@@ -979,7 +995,7 @@ namespace ps3lock
 			}
 
 			std::printf("\n=== PS3LOCK activation request ===\n");
-			std::printf("file : %s (%u bytes)  ← 把这个文件发给作者\n", path, static_cast<unsigned>(sizeof(request)));
+			std::printf("file : %s (%u bytes)  <- send this file to the author\n", path.c_str(), static_cast<unsigned>(sizeof(request)));
 			std::printf("code : %s\n", base32_grouped(request, sizeof(request)).c_str());
 			std::printf("key  : %s (wrapping: %s)\n\n",
 				have_key ? "ok" : "missing", mk.used_tpm ? "TPM" : (have_key ? "DPAPI" : "-"));
@@ -996,7 +1012,10 @@ namespace ps3lock
 			std::printf("\n");
 		}
 
-		for (const std::string& candidate : {"license.bin", (config_dir() + "license.bin")})
+		const std::string config_license = config_dir() + "license.bin";
+		const std::string candidates[2] = {"license.bin", config_license};
+
+		for (const std::string& candidate : candidates)
 		{
 			fs::file lf(candidate);
 			if (!lf)
