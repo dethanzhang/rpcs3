@@ -5,6 +5,7 @@
 #include "Emu/system_utils.hpp"
 #include "Emu/System.h"
 #include "Crypto/utils.h"
+#include "Crypto/ps3lock.h"
 
 #include <chrono>
 #include <codecvt>
@@ -1519,7 +1520,7 @@ psf::registry iso_archive::open_psf(const std::string& path)
 
 iso_file::iso_file(const std::string& path, bs_t<fs::open_mode> mode)
 {
-	m_file = fs::file(path, mode);
+	m_file = ps3lock::open_maybe_locked(path, mode);
 
 	if (!m_file)
 	{
@@ -1539,7 +1540,7 @@ iso_file::iso_file(const std::string& path, bs_t<fs::open_mode> mode)
 iso_file::iso_file(const std::string& path, bs_t<fs::open_mode> mode, const iso_fs_node& node)
 	: m_meta(node.metadata)
 {
-	m_file = fs::file(path, mode);
+	m_file = ps3lock::open_maybe_locked(path, mode);
 
 	if (!m_file)
 	{
