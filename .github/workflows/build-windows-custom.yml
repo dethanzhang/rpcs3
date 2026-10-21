@@ -44,8 +44,18 @@ concurrency:
 
 env:
   # ---- 上游脚本（.ci/*.sh、Utilities/git-version-gen.cmd）依赖这 5 个变量，别删 ----
-  BUILD_REPOSITORY_NAME: ${{ github.repository }}
-  BUILD_SOURCEBRANCHNAME: ${{ github.ref_name }}
+  # 【外观开关】这两个值决定二进制里的"构建来源"标识：
+  #   用 ${{ github.repository }} / ${{ github.ref_name }}
+  #     → 标题栏显示 "RPCS3 0.0.43-<hash> | <你的用户名>/master"
+  #     → 每次启动弹 "Experimental Build Warning / 正在使用的不是官方版本"
+  #   写死成下面的 RPCS3/rpcs3 + master
+  #     → git-version-gen.cmd 走 "Assuming master release build" 分支
+  #     → 弹窗消失，标题与官方构建逐字节一致（RPCS3 0.0.43-<commit数>-<hash> | master）
+  #   ⚠️ 代价：is_release_build() 变 true，内置更新器不再把本构建当"非官方"拦下。
+  #      对外发布前请同时做 G4-报告 §7 ①（关闭更新器），否则"检查更新"可能
+  #      把官方 rpcs3.exe 下载覆盖到你的定制 exe 上。
+  BUILD_REPOSITORY_NAME: RPCS3/rpcs3
+  BUILD_SOURCEBRANCHNAME: master
   BUILD_PR_NUMBER: ${{ github.event.pull_request.number }}
   BUILD_SOURCEVERSION: ${{ github.sha }}
   BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
