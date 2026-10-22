@@ -396,6 +396,7 @@ namespace ps3lock
 		NCRYPT_PROV_HANDLE prov = 0;
 		NCRYPT_KEY_HANDLE key = 0;
 		u8 modulus[RSA_BYTES] = {};
+		std::string note;   // e.g. why the TPM provider was skipped
 
 		~machine_key()
 		{
@@ -481,6 +482,7 @@ namespace ps3lock
 		return false;
 
 	have_key:
+		out.note = err;   // keeps the TPM failure message when we fell back to software KSP
 		std::vector<u8> blob(1024);
 		DWORD need = 0;
 		NTSTATUS st = NCryptExportKey(out.key, 0, BCRYPT_RSAPUBLIC_BLOB, nullptr, blob.data(), static_cast<DWORD>(blob.size()), &need, 0);
@@ -947,6 +949,10 @@ namespace ps3lock
 			const std::string req_path = write_output("machine.req", request, sizeof(request), req_status);
 
 			addf(out, "key provider : %s\n", mk.used_tpm ? "TPM (non-exportable)" : "software KSP (non-exportable)");
+			if (!mk.used_tpm && !mk.note.empty())
+			{
+				addf(out, "tpm note     : %s\n", mk.note.c_str());
+			}
 			addf(out, "machine key  : %s\n", config_dir().c_str());
 			if (req_path.empty())
 			{
@@ -970,6 +976,10 @@ namespace ps3lock
 		{
 			addf(out, "machine key : present\n");
 			addf(out, "provider    : %s\n", mk.used_tpm ? "TPM (non-exportable)" : "software KSP (non-exportable)");
+			if (!mk.used_tpm && !mk.note.empty())
+			{
+				addf(out, "tpm note    : %s\n", mk.note.c_str());
+			}
 			addf(out, "modulus[0:16]: ");
 			hex_into(out, mk.modulus, 16);
 			addf(out, "\n");
