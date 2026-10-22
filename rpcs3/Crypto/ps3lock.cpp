@@ -516,11 +516,25 @@ namespace ps3lock
 
 	static bool rsa_oaep_decrypt(machine_key& mk, const u8* in, u8* out, u32& out_len)
 	{
+		// OAEP with SHA-256 needs an explicit padding info, otherwise the provider
+		// rejects NCRYPT_PAD_OAEP_FLAG with NTE_INVALID_PARAMETER (0x80090027).
+		BCRYPT_OAEP_PADDING_INFO pad{};
+		pad.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+
 		DWORD need = BOX_PLAIN;
-		const NTSTATUS st = NCryptDecrypt(mk.key, const_cast<PBYTE>(in), RSA_BYTES, nullptr, out, BOX_PLAIN, &need, NCRYPT_PAD_OAEP_FLAG);
+		NTSTATUS st = NCryptDecrypt(mk.key, const_cast<PBYTE>(in), RSA_BYTES, &pad, out, BOX_PLAIN, &need,
+			NCRYPT_PAD_OAEP_FLAG | NCRYPT_SILENT_FLAG);
+
 		if (st != ERROR_SUCCESS)
 		{
-			ps3lock_log.error("RSA-OAEP decrypt failed: %s", ncrypt_error_text(st));
+			// Some providers refuse NCRYPT_SILENT_FLAG for persisted keys.
+			need = BOX_PLAIN;
+			st = NCryptDecrypt(mk.key, const_cast<PBYTE>(in), RSA_BYTES, &pad, out, BOX_PLAIN, &need, NCRYPT_PAD_OAEP_FLAG);
+		}
+
+		if (st != ERROR_SUCCESS)
+		{
+			ps3lock_log.error("RSA-OAEP(SHA-256) decrypt failed: %s", ncrypt_error_text(st));
 			return false;
 		}
 		out_len = need;
