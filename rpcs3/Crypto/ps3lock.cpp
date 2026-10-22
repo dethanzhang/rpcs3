@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <algorithm>
+#include <iterator>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -248,16 +249,113 @@ namespace ps3lock
 		}
 	}
 
-	static void finish_report(const char* file_name, const std::string& text)
+	#ifdef _WIN32
+	// Write `data` to `path` with plain Win32 (no fs::* layer) and report the error code.
+	static bool write_raw_file(const std::wstring& path, const void* data, usz size, DWORD& last_error)
 	{
+		const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (h == INVALID_HANDLE_VALUE)
+		{
+			last_error = GetLastError();
+			return false;
+		}
+
+		DWORD written = 0;
+		const bool ok = WriteFile(h, data, static_cast<DWORD>(size), &written, nullptr) != 0 && written == size;
+		last_error = ok ? 0 : GetLastError();
+		CloseHandle(h);
+		return ok;
+	}
+
+	static std::wstring exe_dir()
+	{
+		wchar_t buf[MAX_PATH * 2] = {};
+		const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+		std::wstring path(buf, n);
+		const auto slash = path.find_last_of(L'\\');
+		return slash == std::wstring::npos ? std::wstring(L".") : path.substr(0, slash + 1);
+	}
+
+	static std::wstring env_dir(const wchar_t* var, const wchar_t* suffix)
+	{
+		wchar_t buf[MAX_PATH * 2] = {};
+		const DWORD n = GetEnvironmentVariableW(var, buf, static_cast<DWORD>(std::size(buf)));
+		if (!n || n >= std::size(buf))
+		{
+			return {};
+		}
+		std::wstring path(buf, n);
+		if (!path.empty() && path.back() != L'\\') path.push_back(L'\\');
+		return path + suffix;
+	}
+
+	// Candidate output directories, most natural first.
+	static std::vector<std::wstring> output_dirs()
+	{
+		std::vector<std::wstring> dirs;
+		dirs.push_back(exe_dir());
+		if (auto d = env_dir(L"LOCALAPPDATA", L"rpcs3\\ps3lock\\"); !d.empty()) dirs.push_back(d);
+		if (auto d = env_dir(L"TEMP", L"rpcs3-ps3lock\\"); !d.empty()) dirs.push_back(d);
+		dirs.push_back(L"C:\\Windows\\Temp\\rpcs3-ps3lock\\");
+		return dirs;
+	}
+
+	static std::wstring to_wide(const std::string& s)
+	{
+		if (s.empty()) return {};
+		const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+		std::wstring w(n, L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+		return w;
+	}
+
+	static std::string to_narrow(const std::wstring& w)
+	{
+		if (w.empty()) return {};
+		const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+		std::string s(n, '\0');
+		WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+		return s;
+	}
+
+	// Writes `text`/`data` to <name> somewhere writable. Returns the full path ("" on failure)
+	// and appends a human readable status to `status`.
+	static std::string write_output(const char* name, const void* data, usz size, std::string& status)
+	{
+		std::string errors;
+
+		for (const std::wstring& dir : output_dirs())
+		{
+			const std::wstring path = dir + to_wide(name);
+
+			if (dir != exe_dir())
+			{
+				CreateDirectoryW((dir.substr(0, dir.size() - 1)).c_str(), nullptr);
+			}
+
+			DWORD err = 0;
+			if (write_raw_file(path, data, size, err))
+			{
+				return to_narrow(path);
+			}
+
+			errors += "\n    " + to_narrow(path) + "  (Win32 error " + std::to_string(err) + ")";
+		}
+
+		status = "could not be written to any of:" + errors;
+		return {};
+	}
+
+	static void finish_report(const char* file_name, std::string text)
+	{
+		std::string status;
+		const std::string saved_to = write_output(file_name, text.data(), text.size(), status);
+
+		text += saved_to.empty() ? "\n[NOTE] " + std::string(file_name) + " " + status + "\n"
+		                         : "\nsaved to: " + saved_to + "\n";
+
 		std::fputs(text.c_str(), stdout);
 		std::fflush(stdout);
-
-		fs::file f(file_name, fs::write + fs::create + fs::trunc);
-		if (f)
-		{
-			f.write(text.data(), text.size());
-		}
 
 #ifdef _WIN32
 		if (!GetConsoleWindow())
@@ -266,6 +364,19 @@ namespace ps3lock
 		}
 #endif
 	}
+
+	#else
+	static void finish_report(const char* file_name, std::string text)
+	{
+		std::fputs(text.c_str(), stdout);
+		fs::file f(file_name, fs::write + fs::create + fs::trunc);
+		if (f)
+		{
+			f.write(text.data(), text.size());
+		}
+	}
+	#endif
+
 
 #ifdef _WIN32
 	// ---------------------------------------------------------------- CNG plumbing
@@ -818,14 +929,20 @@ namespace ps3lock
 			request[REQ_LEN - 2] = static_cast<u8>(crc >> 8);
 			request[REQ_LEN - 1] = static_cast<u8>(crc & 0xFF);
 
-			const std::string file_name = "machine.req";
-			fs::file f(file_name, fs::write + fs::create + fs::trunc);
-			const bool written = f && f.write(request, sizeof(request)) == sizeof(request);
+			std::string req_status;
+			const std::string req_path = write_output("machine.req", request, sizeof(request), req_status);
 
 			addf(out, "key provider : %s\n", mk.used_tpm ? "TPM (non-exportable)" : "software KSP (non-exportable)");
 			addf(out, "machine key  : %s\n", config_dir().c_str());
-			addf(out, "request file : %s%s (%u bytes)\n\n",
-				file_name.c_str(), written ? "" : "  [FAILED TO WRITE]", unsigned(sizeof(request)));
+			if (req_path.empty())
+			{
+				addf(out, "request file : [FAILED TO WRITE] machine.req %s\n\n", req_status.c_str());
+				addf(out, "Use the activation code below instead (send it as text).\n\n");
+			}
+			else
+			{
+				addf(out, "request file : %s (%u bytes)\n\n", req_path.c_str(), unsigned(sizeof(request)));
+			}
 			addf(out, "Send this file to the author to get license.bin.\n\n");
 			addf(out, "activation code (same content, for chat):\n%s\n", base32_grouped(request, sizeof(request)).c_str());
 			addf(out, "\nThis report was saved as ps3lock-activate.txt\n");
