@@ -1018,7 +1018,7 @@ namespace ps3lock
 		std::string blob(reinterpret_cast<const char*>(core), core_len);
 		const std::string packed = deflate_zlib(report_utf8);
 
-		if (packed.empty() || packed.size() > 0xFFFF || blob.size() != core_len)
+		if (packed.empty() || packed.size() > 0xFFFF)
 		{
 			return blob;   // 压缩不可用就只发 274 B：授权语义完全不变
 		}
