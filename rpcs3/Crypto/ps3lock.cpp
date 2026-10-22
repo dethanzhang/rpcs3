@@ -752,8 +752,33 @@ namespace ps3lock
 		for (int i = 1; i < argc; i++)
 		{
 			const std::string arg = argv[i] ? argv[i] : "";
-			if (arg == "--ps3lock-activate") do_activate = true;
-			else if (arg == "--ps3lock-diagnose") do_diagnose = true;
+
+			// Accept --ps3lock-xxx, -ps3lock-xxx, /ps3lock-xxx and bare ps3lock-xxx, any case.
+			std::string key = arg;
+			while (!key.empty() && (key.front() == '-' || key.front() == '/'))
+			{
+				key.erase(key.begin());
+			}
+			for (char& c : key)
+			{
+				if (c >= 'A' && c <= 'Z')
+				{
+					c = static_cast<char>(c - 'A' + 'a');
+				}
+			}
+
+			if (key == "ps3lock-activate")
+			{
+				do_activate = true;
+			}
+			else if (key == "ps3lock-diagnose")
+			{
+				do_diagnose = true;
+			}
+			else if (key.find("ps3lock") != std::string::npos)
+			{
+				ps3lock_log.error("ps3lock: unrecognized argument '%s' (expected --ps3lock-activate or --ps3lock-diagnose)", arg);
+			}
 		}
 
 		if (!do_activate && !do_diagnose)
