@@ -76,6 +76,37 @@ LOG_CHANNEL(gui_log, "GUI");
 
 std::unique_ptr<raw_mouse_handler> g_raw_mouse_handler;
 
+// UI language used when the user has not picked one yet (or when the saved language is not installed).
+// This build defaults to Chinese (Simplified); system locale and English act as fallbacks.
+static QString get_preferred_language_code(const QStringList& available_codes)
+{
+	static const QStringList preferred_codes = { QStringLiteral("zh_CN"), QStringLiteral("zh-Hans"), QStringLiteral("zh") };
+
+	for (const QString& code : preferred_codes)
+	{
+		if (available_codes.contains(code))
+		{
+			return code;
+		}
+	}
+
+	const QString system_code = QLocale::system().bcp47Name();
+
+	if (available_codes.contains(system_code))
+	{
+		return system_code;
+	}
+
+	const QString system_language_code = QLocale::languageToCode(QLocale(system_code).language());
+
+	if (available_codes.contains(system_language_code))
+	{
+		return system_language_code;
+	}
+
+	return QLocale(QLocale::English).bcp47Name();
+}
+
 s32 gui_application::m_language_id = static_cast<s32>(CELL_SYSUTIL_LANG_ENGLISH_US);
 
 [[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
@@ -316,9 +347,17 @@ void gui_application::Init()
 
 		const auto codes    = GetAvailableLanguageCodes();
 		const auto language = m_gui_settings->GetValue(gui::loc_language).toString();
-		const auto index    = codes.indexOf(language);
 
-		LoadLanguage(index < 0 ? QLocale(QLocale::English).bcp47Name() : ::at32(codes, index));
+		QString language_code = language;
+
+		if (!codes.contains(language_code))
+		{
+			// No translation installed for the configured language (also covers a first run without settings)
+			language_code = get_preferred_language_code(codes);
+			gui_log.notice("Language '%s' is not installed, using '%s'", language, language_code);
+		}
+
+		LoadLanguage(language_code);
 
 		connect(m_main_window, &main_window::RequestLanguageChange, this, &gui_application::LoadLanguage);
 		connect(m_main_window, &main_window::RequestGlobalStylesheetChange, this, &gui_application::OnChangeStyleSheetRequest);
@@ -527,6 +566,8 @@ void gui_application::set_language_code(QString language_code)
 		{"ru", CELL_SYSUTIL_LANG_RUSSIAN },
 		{"ko", CELL_SYSUTIL_LANG_KOREAN },
 		{"zh", CELL_SYSUTIL_LANG_CHINESE_T },
+		{"zh-cn", CELL_SYSUTIL_LANG_CHINESE_S },
+		{"zh-sg", CELL_SYSUTIL_LANG_CHINESE_S },
 		{"zh-hant", CELL_SYSUTIL_LANG_CHINESE_T },
 		{"zh-hans", CELL_SYSUTIL_LANG_CHINESE_S },
 		{"fi", CELL_SYSUTIL_LANG_FINNISH },

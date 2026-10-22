@@ -335,7 +335,7 @@ namespace gui
 
 	const gui_save cfg_geometry = gui_save(config, "geometry", QByteArray());
 
-	const gui_save loc_language = gui_save(localization, "language", "en");
+	const gui_save loc_language = gui_save(localization, "language", "zh_CN"); // default UI language: Chinese (Simplified)
 
 	const gui_save pads_show_emulated = gui_save(pad_settings, "show_emulated_values", false);
 	const gui_save pads_geometry      = gui_save(pad_settings, "geometry",             QByteArray());
