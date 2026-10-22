@@ -249,6 +249,48 @@ namespace ps3lock
 		}
 	}
 
+	// Report text is UTF-8 internally (sources build with /utf-8, paths come from to_narrow()).
+	// cmd's `type` and MessageBoxA both want the ANSI code page, so convert once before writing.
+	// CP936 first (the .bat switches the console to 936), then the system ANSI page as fallback.
+	static std::string to_ansi(const std::string& utf8)
+	{
+#ifdef _WIN32
+		if (utf8.empty()) return {};
+
+		const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+		if (wlen <= 0) return utf8;
+
+		std::wstring wide(static_cast<usz>(wlen), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), wlen);
+
+		const UINT cps[2] = {936u, GetACP()};
+		for (const UINT cp : cps)
+		{
+			const int n = WideCharToMultiByte(cp, 0, wide.data(), wlen, nullptr, 0, nullptr, nullptr);
+			if (n <= 0) continue;
+			std::string out(static_cast<usz>(n), '\0');
+			WideCharToMultiByte(cp, 0, wide.data(), wlen, out.data(), n, nullptr, nullptr);
+			return out;
+		}
+		return utf8;
+#else
+		return utf8;
+#endif
+	}
+
+	// Notepad and MessageBoxA want CRLF; the report text only ever contains bare '\n'.
+	static std::string to_crlf(const std::string& text)
+	{
+		std::string out;
+		out.reserve(text.size() + text.size() / 16 + 8);
+		for (const char c : text)
+		{
+			if (c == '\n') out += '\r';
+			out += c;
+		}
+		return out;
+	}
+
 	#ifdef _WIN32
 	// Write `data` to `path` with plain Win32 (no fs::* layer) and report the error code.
 	static bool write_raw_file(const std::wstring& path, const void* data, usz size, DWORD& last_error)
@@ -348,19 +390,23 @@ namespace ps3lock
 
 	static void finish_report(const char* file_name, std::string text)
 	{
+		text = to_crlf(text);
+		const std::string ansi_text = to_ansi(text);
+
 		std::string status;
-		const std::string saved_to = write_output(file_name, text.data(), text.size(), status);
+		const std::string saved_to = write_output(file_name, ansi_text.data(), ansi_text.size(), status);
 
-		text += saved_to.empty() ? "\n[NOTE] " + std::string(file_name) + " " + status + "\n"
-		                         : "\nsaved to: " + saved_to + "\n";
+		text += saved_to.empty() ? "\n[注意] " + std::string(file_name) + " " + status + "\n"
+		                         : "\n已保存到: " + saved_to + "\n";
 
-		std::fputs(text.c_str(), stdout);
+		const std::string shown = to_ansi(text);
+		std::fputs(shown.c_str(), stdout);
 		std::fflush(stdout);
 
 #ifdef _WIN32
 		if (!GetConsoleWindow())
 		{
-			MessageBoxA(nullptr, text.c_str(), "PS3LOCK", MB_ICONINFORMATION | MB_OK);
+			MessageBoxA(nullptr, shown.c_str(), to_ansi("机战 2OG 移植版").c_str(), MB_ICONINFORMATION | MB_OK);
 		}
 #endif
 	}
@@ -368,6 +414,7 @@ namespace ps3lock
 	#else
 	static void finish_report(const char* file_name, std::string text)
 	{
+		text = to_ansi(to_crlf(text));
 		std::fputs(text.c_str(), stdout);
 		fs::file f(file_name, fs::write + fs::create + fs::trunc);
 		if (f)
@@ -431,7 +478,7 @@ namespace ps3lock
 			if (NCryptOpenStorageProvider(&out.prov, providers[i], 0) != ERROR_SUCCESS)
 			{
 				out.prov = 0;
-				err = "cannot open storage provider";
+				err = "打不开密钥存储提供程序";
 				continue;
 			}
 
@@ -447,7 +494,7 @@ namespace ps3lock
 			{
 				NCryptFreeObject(out.prov);
 				out.prov = 0;
-				err = "machine key not found (run --ps3lock-activate)";
+				err = "没有找到机器密钥（请先做激活：--ps3lock-activate）";
 				continue;
 			}
 
@@ -457,7 +504,7 @@ namespace ps3lock
 				out.key = 0;
 				NCryptFreeObject(out.prov);
 				out.prov = 0;
-				err = "NCryptCreatePersistedKey failed: " + ncrypt_error_text(st) + (i == 0 ? " (TPM)" : " (software)");
+				err = "创建密钥失败：" + ncrypt_error_text(st) + (i == 0 ? "（TPM）" : "（软件 KSP）");
 				continue;
 			}
 
@@ -471,7 +518,7 @@ namespace ps3lock
 				out.key = 0;
 				NCryptFreeObject(out.prov);
 				out.prov = 0;
-				err = "NCryptFinalizeKey failed: " + ncrypt_error_text(st);
+				err = "密钥落地失败：" + ncrypt_error_text(st);
 				continue;
 			}
 
@@ -488,7 +535,7 @@ namespace ps3lock
 		NTSTATUS st = NCryptExportKey(out.key, 0, BCRYPT_RSAPUBLIC_BLOB, nullptr, blob.data(), static_cast<DWORD>(blob.size()), &need, 0);
 		if (st != ERROR_SUCCESS)
 		{
-			err = "NCryptExportKey failed: " + ncrypt_error_text(st);
+			err = "导出公钥失败：" + ncrypt_error_text(st);
 			return false;
 		}
 
@@ -497,7 +544,7 @@ namespace ps3lock
 		// BCRYPT_RSAKEY_BLOB: magic, bitlen, cbPublicExp, cbModulus, cbPrime1, cbPrime2, exp[], mod[]
 		if (blob.size() < 24 + 3 + RSA_BYTES)
 		{
-			err = "unexpected RSA public blob size";
+			err = "公钥数据长度异常";
 			return false;
 		}
 
@@ -507,7 +554,7 @@ namespace ps3lock
 
 		if (magic != BCRYPT_RSAPUBLIC_MAGIC || cb_mod != RSA_BYTES || cb_exp != 3)
 		{
-			err = "unexpected RSA public blob layout";
+			err = "公钥数据格式异常";
 			return false;
 		}
 
@@ -520,7 +567,7 @@ namespace ps3lock
 	static bool machine_key_delete(std::string& note)
 	{
 		const wchar_t* providers[2] = {MS_PLATFORM_KEY_STORAGE_PROVIDER, MS_KEY_STORAGE_PROVIDER};
-		const char* names[2] = {"TPM", "software KSP"};
+		const char* names[2] = {"TPM", "软件 KSP"};
 		bool deleted = false;
 
 		for (int i = 0; i < 2; i++)
@@ -538,11 +585,11 @@ namespace ps3lock
 				if (st == ERROR_SUCCESS)
 				{
 					deleted = true;
-					note += std::string(note.empty() ? "" : ", ") + "deleted from " + names[i];
+					note += std::string(note.empty() ? "" : ", ") + "已从 " + names[i] + " 删除";
 				}
 				else
 				{
-					note += std::string(note.empty() ? "" : ", ") + "delete failed on " + names[i] + " (" + ncrypt_error_text(st) + ")";
+					note += std::string(note.empty() ? "" : ", ") + "在 " + names[i] + " 上删除失败 (" + ncrypt_error_text(st) + ")";
 				}
 			}
 
@@ -551,7 +598,7 @@ namespace ps3lock
 
 		if (!deleted && note.empty())
 		{
-			note = "no existing machine key found";
+			note = "没有找到已存在的机器密钥";
 		}
 		return deleted;
 	}
@@ -652,12 +699,12 @@ namespace ps3lock
 		license_info info;
 		if (blob.size() != LIC_HDR_LEN + TAG_SIZE + LIC_SIG_LEN || std::memcmp(blob.data(), LICENSE_MAGIC, 8) != 0)
 		{
-			info.error = "not a PS3LIC04 license (or wrong size)";
+			info.error = "不是 PS3LIC04 授权文件（或长度不对）";
 			return info;
 		}
 		if (blob[8] != LIC_VER)
 		{
-			info.error = "unsupported license version";
+			info.error = "授权文件版本不支持";
 			return info;
 		}
 
@@ -665,7 +712,7 @@ namespace ps3lock
 		hash_sha256(blob.data(), LIC_HDR_LEN + TAG_SIZE, hash);
 		if (!ecdsa_p256_verify(hash, blob.data() + LIC_HDR_LEN + TAG_SIZE))
 		{
-			info.error = "license signature invalid";
+			info.error = "授权文件签名无效";
 			return info;
 		}
 
@@ -965,7 +1012,7 @@ namespace ps3lock
 		{
 			std::string key_note;
 			machine_key_delete(key_note);
-			reset_note = "machine key: " + key_note;
+			reset_note = "机器密钥：" + key_note;
 
 			// Remove stale activation files (best effort).
 			const std::string cfg = config_dir();
@@ -992,15 +1039,15 @@ namespace ps3lock
 
 		if (do_activate)
 		{
-			addf(out, "=== PS3LOCK activation ===\n\n");
+			addf(out, "=== 机战 2OG 移植版 · 第一步：生成申请码 ===\n\n");
 			if (!reset_note.empty())
 			{
-				addf(out, "reset        : %s\n\n", reset_note.c_str());
+				addf(out, "重置结果     : %s\n\n", reset_note.c_str());
 			}
 
 			if (!have_key)
 			{
-				addf(out, "FAILED: %s\n", err.c_str());
+				addf(out, "失败：%s\n", err.c_str());
 				finish_report("ps3lock-activate.txt", out);
 				return true;
 			}
@@ -1023,70 +1070,70 @@ namespace ps3lock
 			std::string req_status;
 			const std::string req_path = write_output("machine.req", request, sizeof(request), req_status);
 
-			addf(out, "key provider : %s\n", mk.used_tpm ? "TPM (non-exportable)" : "software KSP (non-exportable)");
+			addf(out, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
 			if (!mk.used_tpm && !mk.note.empty())
 			{
-				addf(out, "tpm note     : %s\n", mk.note.c_str());
+				addf(out, "TPM 说明     : %s\n", mk.note.c_str());
 			}
-			addf(out, "machine key  : %s\n", config_dir().c_str());
+			addf(out, "密钥目录     : %s\n", config_dir().c_str());
 			if (req_path.empty())
 			{
-				addf(out, "request file : [FAILED TO WRITE] machine.req %s\n\n", req_status.c_str());
-				addf(out, "Use the activation code below instead (send it as text).\n\n");
+				addf(out, "申请码文件   : [写入失败] machine.req %s\n\n", req_status.c_str());
+				addf(out, "请改用下面的激活码（发文字即可）。\n\n");
 			}
 			else
 			{
-				addf(out, "request file : %s (%u bytes)\n\n", req_path.c_str(), unsigned(sizeof(request)));
+				addf(out, "申请码文件   : %s（%u 字节）\n\n", req_path.c_str(), unsigned(sizeof(request)));
 			}
-			addf(out, "Send this file to the author to get license.bin.\n\n");
-			addf(out, "activation code (same content, for chat):\n%s\n", base32_grouped(request, sizeof(request)).c_str());
-			addf(out, "\nThis report was saved as ps3lock-activate.txt\n");
+			addf(out, "请把 machine.req 这个文件发给作者，作者会回给你 license.bin。\n\n");
+			addf(out, "激活码（内容和文件一样，直接发聊天文字也可以）：\n%s\n", base32_grouped(request, sizeof(request)).c_str());
+			addf(out, "\n本报告已保存为 ps3lock-activate.txt\n");
 
 			finish_report("ps3lock-activate.txt", out);
 			return true;
 		}
 
-		addf(out, "=== PS3LOCK diagnose ===\n\n");
+		addf(out, "=== 机战 2OG 移植版 · 激活状态检查 ===\n\n");
 		if (have_key)
 		{
-			addf(out, "machine key : present\n");
-			addf(out, "provider    : %s\n", mk.used_tpm ? "TPM (non-exportable)" : "software KSP (non-exportable)");
+			addf(out, "机器密钥     : 已存在\n");
+			addf(out, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
 			if (!mk.used_tpm && !mk.note.empty())
 			{
-				addf(out, "tpm note    : %s\n", mk.note.c_str());
+				addf(out, "TPM 说明     : %s\n", mk.note.c_str());
 			}
-			addf(out, "modulus[0:16]: ");
+			addf(out, "公钥前 16 字节: ");
 			hex_into(out, mk.modulus, 16);
 			addf(out, "\n");
 		}
 		else
 		{
-			addf(out, "machine key : MISSING (%s)\n", err.c_str());
+			addf(out, "机器密钥     : 缺失（%s）\n", err.c_str());
 		}
-		addf(out, "config dir  : %s\n\n", config_dir().c_str());
+		addf(out, "配置目录     : %s\n\n", config_dir().c_str());
 
 		for (const std::string& candidate : license_candidates(""))
 		{
 			fs::file lf(candidate);
 			if (!lf)
 			{
-				addf(out, "license     : %s  (not found)\n", candidate.c_str());
+				addf(out, "授权文件     : %s  （未找到）\n", candidate.c_str());
 				continue;
 			}
 
 			std::vector<u8> blob(lf.size());
 			lf.read(blob.data(), blob.size());
 			const license_info lic = parse_license(blob);
-			addf(out, "license     : %s  -> %s\n", candidate.c_str(), lic.ok ? "valid signature" : lic.error.c_str());
+			addf(out, "授权文件     : %s  -> %s\n", candidate.c_str(), lic.ok ? "签名有效 (valid signature)" : lic.error.c_str());
 			if (lic.ok)
 			{
-				addf(out, "recipient   : ");
+				addf(out, "收件人编号   : ");
 				hex_into(out, lic.recipient, 16);
 				addf(out, "\n");
 			}
 		}
 
-		addf(out, "\nThis report was saved as ps3lock-diagnose.txt\n");
+		addf(out, "\n本报告已保存为 ps3lock-diagnose.txt\n");
 		finish_report("ps3lock-diagnose.txt", out);
 		return true;
 #else
