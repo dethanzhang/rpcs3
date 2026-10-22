@@ -516,6 +516,46 @@ namespace ps3lock
 		return true;
 	}
 
+	// Deletes the persisted machine key from every provider that has it.
+	static bool machine_key_delete(std::string& note)
+	{
+		const wchar_t* providers[2] = {MS_PLATFORM_KEY_STORAGE_PROVIDER, MS_KEY_STORAGE_PROVIDER};
+		const char* names[2] = {"TPM", "software KSP"};
+		bool deleted = false;
+
+		for (int i = 0; i < 2; i++)
+		{
+			NCRYPT_PROV_HANDLE prov = 0;
+			if (NCryptOpenStorageProvider(&prov, providers[i], 0) != ERROR_SUCCESS)
+			{
+				continue;
+			}
+
+			NCRYPT_KEY_HANDLE key = 0;
+			if (NCryptOpenKey(prov, &key, MACHINE_KEY_NAME, 0, 0) == ERROR_SUCCESS)
+			{
+				const NTSTATUS st = NCryptDeleteKey(key, 0);
+				if (st == ERROR_SUCCESS)
+				{
+					deleted = true;
+					note += std::string(note.empty() ? "" : ", ") + "deleted from " + names[i];
+				}
+				else
+				{
+					note += std::string(note.empty() ? "" : ", ") + "delete failed on " + names[i] + " (" + ncrypt_error_text(st) + ")";
+				}
+			}
+
+			NCryptFreeObject(prov);
+		}
+
+		if (!deleted && note.empty())
+		{
+			note = "no existing machine key found";
+		}
+		return deleted;
+	}
+
 	static bool rsa_oaep_decrypt(machine_key& mk, const u8* in, u8* out, u32& out_len)
 	{
 		// OAEP with SHA-256 needs an explicit padding info, otherwise the provider
@@ -875,6 +915,7 @@ namespace ps3lock
 	{
 		bool do_activate = false;
 		bool do_diagnose = false;
+		bool do_reset = false;
 
 		for (int i = 1; i < argc; i++)
 		{
@@ -902,18 +943,48 @@ namespace ps3lock
 			{
 				do_diagnose = true;
 			}
+			else if (key == "ps3lock-reset")
+			{
+				do_reset = true;
+			}
 			else if (key.find("ps3lock") != std::string::npos)
 			{
 				ps3lock_log.error("ps3lock: unrecognized argument '%s' (expected --ps3lock-activate or --ps3lock-diagnose)", arg);
 			}
 		}
 
-		if (!do_activate && !do_diagnose)
+		if (!do_activate && !do_diagnose && !do_reset)
 		{
 			return false;
 		}
 
 #ifdef _WIN32
+		std::string reset_note;
+
+		if (do_reset)
+		{
+			std::string key_note;
+			machine_key_delete(key_note);
+			reset_note = "machine key: " + key_note;
+
+			// Remove stale activation files (best effort).
+			const std::string cfg = config_dir();
+			const std::string to_remove[] = {
+				cfg + "license.bin", cfg + "machine.key", "machine.req",
+				"ps3lock-activate.txt", "ps3lock-diagnose.txt",
+			};
+
+			for (const std::string& path : to_remove)
+			{
+				if (DeleteFileW(to_wide(path).c_str()))
+				{
+					reset_note += "\nremoved: " + path;
+				}
+			}
+
+			do_activate = true;   // regenerate a fresh machine.req right away
+		}
+
 		machine_key mk;
 		std::string err;
 		const bool have_key = machine_key_open(mk, do_activate, err);
@@ -922,6 +993,10 @@ namespace ps3lock
 		if (do_activate)
 		{
 			addf(out, "=== PS3LOCK activation ===\n\n");
+			if (!reset_note.empty())
+			{
+				addf(out, "reset        : %s\n\n", reset_note.c_str());
+			}
 
 			if (!have_key)
 			{

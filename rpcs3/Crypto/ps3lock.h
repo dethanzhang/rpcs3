@@ -23,6 +23,6 @@ namespace ps3lock
 	// (invalid file + log error when the license is missing/invalid).
 	fs::file open_maybe_locked(const std::string& path, bs_t<fs::open_mode> mode);
 
-	// Handles --ps3lock-activate / --ps3lock-diagnose. Returns true when handled.
+	// Handles --ps3lock-activate / --ps3lock-diagnose / --ps3lock-reset. Returns true when handled.
 	bool handle_command_line(int argc, char** argv);
 }
