@@ -14,12 +14,15 @@
 #include <algorithm>
 #include <iterator>
 
+#include <zlib.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
 #include <ncrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ncrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 LOG_CHANNEL(ps3lock_log, "PS3LOCK");
@@ -250,9 +253,9 @@ namespace ps3lock
 	}
 
 	// Report text is UTF-8 internally (sources build with /utf-8, paths come from to_narrow()).
-	// cmd's `type` and MessageBoxA both want the ANSI code page, so convert once before writing.
+	// cmd's `type` / Notepad / MessageBoxA want the ANSI code page, so convert once before writing.
 	// CP936 first (the .bat switches the console to 936), then the system ANSI page as fallback.
-	static std::string to_ansi(const std::string& utf8)
+	[[maybe_unused]] static std::string to_ansi(const std::string& utf8)
 	{
 #ifdef _WIN32
 		if (utf8.empty()) return {};
@@ -279,7 +282,7 @@ namespace ps3lock
 	}
 
 	// Notepad and MessageBoxA want CRLF; the report text only ever contains bare '\n'.
-	static std::string to_crlf(const std::string& text)
+	[[maybe_unused]] static std::string to_crlf(const std::string& text)
 	{
 		std::string out;
 		out.reserve(text.size() + text.size() / 16 + 8);
@@ -388,42 +391,22 @@ namespace ps3lock
 		return {};
 	}
 
-	static void finish_report(const char* file_name, std::string text)
+	// Writes a UTF-8 report as GBK + CRLF (cmd `type`, Notepad and MessageBox all want that).
+	static std::string write_text_file(const char* name, const std::string& utf8_text, std::string& status)
 	{
-		text = to_crlf(text);
-		const std::string ansi_text = to_ansi(text);
+		const std::string ansi = to_ansi(to_crlf(utf8_text));
+		return write_output(name, ansi.data(), ansi.size(), status);
+	}
 
-		std::string status;
-		const std::string saved_to = write_output(file_name, ansi_text.data(), ansi_text.size(), status);
-
-		text += saved_to.empty() ? "\n[注意] " + std::string(file_name) + " " + status + "\n"
-		                         : "\n已保存到: " + saved_to + "\n";
-
-		const std::string shown = to_ansi(text);
+	// Console output only — the .bat window is the UI, never pop a message box.
+	static void print_text(const std::string& utf8_text)
+	{
+		const std::string shown = to_ansi(to_crlf(utf8_text));
 		std::fputs(shown.c_str(), stdout);
 		std::fflush(stdout);
-
-#ifdef _WIN32
-		if (!GetConsoleWindow())
-		{
-			MessageBoxA(nullptr, shown.c_str(), to_ansi("机战 2OG 移植版").c_str(), MB_ICONINFORMATION | MB_OK);
-		}
-#endif
 	}
 
-	#else
-	static void finish_report(const char* file_name, std::string text)
-	{
-		text = to_ansi(to_crlf(text));
-		std::fputs(text.c_str(), stdout);
-		fs::file f(file_name, fs::write + fs::create + fs::trunc);
-		if (f)
-		{
-			f.write(text.data(), text.size());
-		}
-	}
 	#endif
-
 
 #ifdef _WIN32
 	// ---------------------------------------------------------------- CNG plumbing
@@ -854,6 +837,206 @@ namespace ps3lock
 			m_under.close();
 		}
 	};
+
+	// ---------------------------------------------------------------- reports / machine info
+	static void add_be32(std::string& out, u32 v)
+	{
+		out += static_cast<char>((v >> 24) & 0xFF);
+		out += static_cast<char>((v >> 16) & 0xFF);
+		out += static_cast<char>((v >> 8) & 0xFF);
+		out += static_cast<char>(v & 0xFF);
+	}
+
+	// zlib (RFC1950) wrapper — the same stream `zlib.decompress()` eats on the signing side.
+	static std::string deflate_zlib(const std::string& plain)
+	{
+		if (plain.empty() || plain.size() > 0x100000)
+		{
+			return {};
+		}
+
+		uLongf size = compressBound(static_cast<uLong>(plain.size()));
+		std::string out(size, '\0');
+		if (compress2(reinterpret_cast<Bytef*>(out.data()), &size,
+			reinterpret_cast<const Bytef*>(plain.data()), static_cast<uLong>(plain.size()), 9) != Z_OK)
+		{
+			return {};
+		}
+		out.resize(size);
+		return out;
+	}
+
+	static std::string env_utf8(const wchar_t* name)
+	{
+		wchar_t buf[512] = {};
+		const DWORD n = GetEnvironmentVariableW(name, buf, static_cast<DWORD>(std::size(buf)));
+		if (!n || n >= std::size(buf))
+		{
+			return {};
+		}
+		return to_narrow(std::wstring(buf, n));
+	}
+
+	static std::string reg_string(HKEY root, const wchar_t* sub, const wchar_t* name)
+	{
+		wchar_t buf[256] = {};
+		DWORD size = sizeof(buf);
+		if (RegGetValueW(root, sub, name, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS)
+		{
+			return {};
+		}
+		return to_narrow(std::wstring(buf));
+	}
+
+	// Everything the signing side wants to keep, kept OUT of the on-screen text.
+	static std::string machine_info_text()
+	{
+		std::string out = "=== 机器信息 ===\n";
+
+		SYSTEMTIME st{};
+		GetLocalTime(&st);
+		addf(out, "报告时间     : %04u-%02u-%02u %02u:%02u:%02u\n",
+			unsigned(st.wYear), unsigned(st.wMonth), unsigned(st.wDay),
+			unsigned(st.wHour), unsigned(st.wMinute), unsigned(st.wSecond));
+
+		wchar_t computer[256] = {};
+		DWORD csize = static_cast<DWORD>(std::size(computer));
+		if (GetComputerNameW(computer, &csize))
+		{
+			out += "计算机名     : " + to_narrow(std::wstring(computer, csize)) + "\n";
+		}
+
+		const wchar_t* cv = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+		const std::string product = reg_string(HKEY_LOCAL_MACHINE, cv, L"ProductName");
+		const std::string build = reg_string(HKEY_LOCAL_MACHINE, cv, L"CurrentBuild");
+		const std::string display = reg_string(HKEY_LOCAL_MACHINE, cv, L"DisplayVersion");
+		if (!product.empty() || !build.empty())
+		{
+			std::string os = product;
+			if (!display.empty()) os += " " + display;
+			if (!build.empty()) os += " (build " + build + ")";
+			out += "操作系统     : " + os + "\n";
+		}
+
+		if (const std::string cpu = env_utf8(L"PROCESSOR_IDENTIFIER"); !cpu.empty())
+		{
+			out += "处理器       : " + cpu + "\n";
+		}
+
+		MEMORYSTATUSEX mem{};
+		mem.dwLength = sizeof(mem);
+		if (GlobalMemoryStatusEx(&mem))
+		{
+			addf(out, "物理内存     : %llu MB\n", static_cast<unsigned long long>(mem.ullTotalPhys >> 20));
+		}
+
+		out += "程序目录     : " + to_narrow(exe_dir()) + "\n";
+		return out;
+	}
+
+	struct diagnose_result
+	{
+		std::string text;
+		bool active = false;
+		std::string reason;
+	};
+
+	// One line summary + the verbose dump. `active` means: this machine's key really opens the license box.
+	static diagnose_result build_diagnose_text(machine_key& mk, bool have_key, const std::string& err)
+	{
+		diagnose_result res;
+		std::string& out = res.text;
+
+		addf(out, "=== 激活状态检查 ===\n\n");
+		if (have_key)
+		{
+			addf(out, "机器密钥     : 已存在\n");
+			addf(out, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
+			if (!mk.used_tpm && !mk.note.empty())
+			{
+				addf(out, "TPM 说明     : %s\n", mk.note.c_str());
+			}
+			addf(out, "公钥前 16 字节: ");
+			hex_into(out, mk.modulus, 16);
+			addf(out, "\n");
+		}
+		else
+		{
+			addf(out, "机器密钥     : 缺失（%s）\n", err.c_str());
+		}
+		addf(out, "配置目录     : %s\n\n", config_dir().c_str());
+
+		for (const std::string& candidate : license_candidates(""))
+		{
+			fs::file lf(candidate);
+			if (!lf)
+			{
+				addf(out, "授权文件     : %s  （未找到）\n", candidate.c_str());
+				continue;
+			}
+
+			std::vector<u8> blob(lf.size());
+			lf.read(blob.data(), blob.size());
+			const license_info lic = parse_license(blob);
+			addf(out, "授权文件     : %s  -> %s\n", candidate.c_str(), lic.ok ? "签名有效 (valid signature)" : lic.error.c_str());
+
+			if (!lic.ok)
+			{
+				if (res.reason.empty()) res.reason = "授权文件无效：" + lic.error;
+				continue;
+			}
+
+			addf(out, "收件人编号   : ");
+			hex_into(out, lic.recipient, 16);
+			addf(out, "\n");
+
+			// The only honest test: can *this* machine's persisted key open the license box?
+			u8 k_iso[32];
+			u8 iv[16];
+			if (have_key && unseal_iso_keys(lic, mk, k_iso, iv))
+			{
+				res.active = true;
+				res.reason = "已安装授权，且与本机密钥匹配";
+			}
+			else if (res.reason.empty())
+			{
+				res.reason = have_key ? "授权文件与本机不匹配（不是这台机器的 license）" : "缺少机器密钥";
+			}
+		}
+
+		if (!res.active && res.reason.empty())
+		{
+			res.reason = "还没有安装授权文件";
+		}
+
+		return res;
+	}
+
+	// machine.req = 274 B request + "P3RX" zlib bundle: the signing side keeps the whole story.
+	static std::string build_request_with_report(const u8* core, usz core_len, const std::string& report_utf8)
+	{
+		std::string blob(reinterpret_cast<const char*>(core), core_len);
+		const std::string packed = deflate_zlib(report_utf8);
+
+		if (packed.empty() || packed.size() > 0xFFFF || blob.size() != core_len)
+		{
+			return blob;   // 压缩不可用就只发 274 B：授权语义完全不变
+		}
+
+		std::string head = "P3RX";
+		head += static_cast<char>(1);   // version
+		head += static_cast<char>(1);   // method: 1 = zlib deflate
+		head += static_cast<char>(0);
+		head += static_cast<char>(0);
+		add_be32(head, static_cast<u32>(packed.size()));
+		add_be32(head, static_cast<u32>(report_utf8.size()));
+
+		const u16 crc = crc16(reinterpret_cast<const u8*>(head.data()), head.size());
+		head += static_cast<char>((crc >> 8) & 0xFF);
+		head += static_cast<char>(crc & 0xFF);
+
+		return blob + head + packed;
+	}
 #endif
 
 	// ---------------------------------------------------------------- public API
@@ -1018,7 +1201,7 @@ namespace ps3lock
 			const std::string cfg = config_dir();
 			const std::string to_remove[] = {
 				cfg + "license.bin", cfg + "machine.key", "machine.req",
-				"ps3lock-activate.txt", "ps3lock-diagnose.txt",
+				"ps3lock-activate.txt", "ps3lock-diagnose.txt", "ps3lock-code.txt", "ps3lock-status.txt",
 			};
 
 			for (const std::string& path : to_remove)
@@ -1035,20 +1218,25 @@ namespace ps3lock
 		machine_key mk;
 		std::string err;
 		const bool have_key = machine_key_open(mk, do_activate, err);
-		std::string out;
+		const std::string info = machine_info_text();
 
 		if (do_activate)
 		{
-			addf(out, "=== 机战 2OG 移植版 · 第一步：生成申请码 ===\n\n");
+			std::string act;
+
+			addf(act, "=== 第一步：生成申请码 ===\n\n");
 			if (!reset_note.empty())
 			{
-				addf(out, "重置结果     : %s\n\n", reset_note.c_str());
+				addf(act, "重置结果     : %s\n\n", reset_note.c_str());
 			}
 
 			if (!have_key)
 			{
-				addf(out, "失败：%s\n", err.c_str());
-				finish_report("ps3lock-activate.txt", out);
+				addf(act, "失败：%s\n", err.c_str());
+
+				std::string wstat;
+				write_text_file("ps3lock-activate.txt", info + "\n" + act, wstat);
+				print_text(act);
 				return true;
 			}
 
@@ -1067,74 +1255,52 @@ namespace ps3lock
 			request[REQ_LEN - 2] = static_cast<u8>(crc >> 8);
 			request[REQ_LEN - 1] = static_cast<u8>(crc & 0xFF);
 
-			std::string req_status;
-			const std::string req_path = write_output("machine.req", request, sizeof(request), req_status);
+			// Base32 text covers only the 274 B core: the chat fallback stays pasteable.
+			const std::string code = base32_grouped(request, sizeof(request));
+			const diagnose_result diag = build_diagnose_text(mk, have_key, err);
 
-			addf(out, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
+			addf(act, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
 			if (!mk.used_tpm && !mk.note.empty())
 			{
-				addf(out, "TPM 说明     : %s\n", mk.note.c_str());
+				addf(act, "TPM 说明     : %s\n", mk.note.c_str());
 			}
-			addf(out, "密钥目录     : %s\n", config_dir().c_str());
-			if (req_path.empty())
-			{
-				addf(out, "申请码文件   : [写入失败] machine.req %s\n\n", req_status.c_str());
-				addf(out, "请改用下面的激活码（发文字即可）。\n\n");
-			}
-			else
-			{
-				addf(out, "申请码文件   : %s（%u 字节）\n\n", req_path.c_str(), unsigned(sizeof(request)));
-			}
-			addf(out, "请把 machine.req 这个文件发给作者，作者会回给你 license.bin。\n\n");
-			addf(out, "激活码（内容和文件一样，直接发聊天文字也可以）：\n%s\n", base32_grouped(request, sizeof(request)).c_str());
-			addf(out, "\n本报告已保存为 ps3lock-activate.txt\n");
+			addf(act, "密钥目录     : %s\n", config_dir().c_str());
+			addf(act, "激活码       :\n%s\n", code.c_str());
+			addf(act, "\n请把 machine.req 这个文件发给作者，作者会回给你 license.bin。\n");
 
-			finish_report("ps3lock-activate.txt", out);
+			const std::string bundle = info + "\n" + act + "\n" + diag.text
+				+ "\n激活判定     : " + (diag.active ? "已激活" : "未激活") + "（" + diag.reason + "）\n";
+
+			// machine.req carries the whole bundle (zlib) so the signing side keeps the full picture.
+			const std::string blob = build_request_with_report(request, sizeof(request), bundle);
+			std::string status;
+			const std::string req_path = write_output("machine.req", blob.data(), blob.size(), status);
+
+			std::string wstat;
+			write_text_file("ps3lock-code.txt", code + "\n", wstat);
+			write_text_file("ps3lock-activate.txt", bundle, wstat);
+
+			ps3lock_log.notice("activation request: %s (%u B, report %u B compressed)",
+				req_path.empty() ? status.c_str() : req_path.c_str(), unsigned(blob.size()), unsigned(bundle.size()));
+
+			print_text("激活码：\n" + code + "\n");
 			return true;
 		}
 
-		addf(out, "=== 机战 2OG 移植版 · 激活状态检查 ===\n\n");
-		if (have_key)
-		{
-			addf(out, "机器密钥     : 已存在\n");
-			addf(out, "密钥类型     : %s\n", mk.used_tpm ? "TPM（密钥不可导出）" : "软件 KSP（密钥不可导出）");
-			if (!mk.used_tpm && !mk.note.empty())
-			{
-				addf(out, "TPM 说明     : %s\n", mk.note.c_str());
-			}
-			addf(out, "公钥前 16 字节: ");
-			hex_into(out, mk.modulus, 16);
-			addf(out, "\n");
-		}
-		else
-		{
-			addf(out, "机器密钥     : 缺失（%s）\n", err.c_str());
-		}
-		addf(out, "配置目录     : %s\n\n", config_dir().c_str());
+		const diagnose_result res = build_diagnose_text(mk, have_key, err);
 
-		for (const std::string& candidate : license_candidates(""))
-		{
-			fs::file lf(candidate);
-			if (!lf)
-			{
-				addf(out, "授权文件     : %s  （未找到）\n", candidate.c_str());
-				continue;
-			}
+		std::string status_text;
+		addf(status_text, "status=%s\n", res.active ? "ACTIVE" : "INACTIVE");
+		addf(status_text, "激活状态：%s\n", res.active ? "已激活" : "未激活");
+		addf(status_text, "说明：%s\n", res.reason.c_str());
 
-			std::vector<u8> blob(lf.size());
-			lf.read(blob.data(), blob.size());
-			const license_info lic = parse_license(blob);
-			addf(out, "授权文件     : %s  -> %s\n", candidate.c_str(), lic.ok ? "签名有效 (valid signature)" : lic.error.c_str());
-			if (lic.ok)
-			{
-				addf(out, "收件人编号   : ");
-				hex_into(out, lic.recipient, 16);
-				addf(out, "\n");
-			}
-		}
+		std::string wstat;
+		write_text_file("ps3lock-status.txt", status_text, wstat);
+		write_text_file("ps3lock-diagnose.txt", info + "\n" + res.text, wstat);
 
-		addf(out, "\n本报告已保存为 ps3lock-diagnose.txt\n");
-		finish_report("ps3lock-diagnose.txt", out);
+		ps3lock_log.notice("license status: %s (%s)", res.active ? "ACTIVE" : "INACTIVE", res.reason.c_str());
+
+		print_text(std::string("激活状态：") + (res.active ? "已激活" : "未激活") + "\n");
 		return true;
 #else
 		std::printf("PS3LOCK: not supported on this platform\n");
