@@ -10,6 +10,7 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <cstdarg>
 #include <algorithm>
 
 #ifdef _WIN32
@@ -937,6 +938,38 @@ namespace ps3lock
 #endif
 	}
 
+	// Small printf-style append helper (no fmt dependency here).
+	static void addf(std::string& out, const char* fmt, ...)
+	{
+		char buf[1024];
+		va_list args;
+		va_start(args, fmt);
+		std::vsnprintf(buf, sizeof(buf), fmt, args);
+		va_end(args);
+		out += buf;
+	}
+
+	// Write the report to stdout, to a file next to the working dir, and show a
+	// message box when launched without a console (double click).
+	static void finish_report(const char* file_name, const std::string& text)
+	{
+		std::fputs(text.c_str(), stdout);
+		std::fflush(stdout);
+
+		fs::file f(file_name, fs::write + fs::create + fs::trunc);
+		if (f)
+		{
+			f.write(text.data(), text.size());
+		}
+
+#ifdef _WIN32
+		if (!GetConsoleWindow())
+		{
+			MessageBoxA(nullptr, text.c_str(), "PS3LOCK", MB_ICONINFORMATION | MB_OK);
+		}
+#endif
+	}
+
 	bool handle_command_line(int argc, char** argv)
 	{
 		bool do_activate = false;
@@ -957,12 +990,17 @@ namespace ps3lock
 #ifdef _WIN32
 		machine_key mk;
 		const bool have_key = load_machine_key(mk, do_activate);
+		std::string out;
 
 		if (do_activate)
 		{
+			addf(out, "=== PS3LOCK activation ===\n\n");
+
 			if (!have_key)
 			{
-				std::printf("PS3LOCK: failed to create/load machine key\n");
+				addf(out, "FAILED: could not create or load the machine key.\n");
+				addf(out, "        config dir: %s\n", config_dir().c_str());
+				finish_report("ps3lock-activate.txt", out);
 				return true;
 			}
 
@@ -989,28 +1027,30 @@ namespace ps3lock
 
 			const std::string path = "machine.req";
 			fs::file f(path, fs::write + fs::create + fs::trunc);
-			if (f)
-			{
-				f.write(request, sizeof(request));
-			}
+			const bool written = f && f.write(request, sizeof(request)) == sizeof(request);
 
-			std::printf("\n=== PS3LOCK activation request ===\n");
-			std::printf("file : %s (%u bytes)  <- send this file to the author\n", path.c_str(), static_cast<unsigned>(sizeof(request)));
-			std::printf("code : %s\n", base32_grouped(request, sizeof(request)).c_str());
-			std::printf("key  : %s (wrapping: %s)\n\n",
-				have_key ? "ok" : "missing", mk.used_tpm ? "TPM" : (have_key ? "DPAPI" : "-"));
+			addf(out, "key wrapping : %s\n", mk.used_tpm ? "TPM (non-exportable RSA)" : "DPAPI (software)");
+			addf(out, "machine key  : %s\n", config_dir().c_str());
+			addf(out, "\nrequest file : %s%s (%u bytes)\n",
+				path.c_str(), written ? "" : "  [FAILED TO WRITE]", static_cast<unsigned>(sizeof(request)));
+			addf(out, "send this file to the author.\n\n");
+			addf(out, "activation code (same content, for chat):\n%s\n", base32_grouped(request, sizeof(request)).c_str());
+			addf(out, "\nThis file is saved as ps3lock-activate.txt in the current folder.\n");
+
+			finish_report("ps3lock-activate.txt", out);
 			return true;
 		}
 
-		std::printf("\n=== PS3LOCK diagnose ===\n");
-		std::printf("machine key : %s\n", have_key ? "present" : "missing");
+		addf(out, "=== PS3LOCK diagnose ===\n\n");
+		addf(out, "machine key : %s\n", have_key ? "present" : "MISSING (run --ps3lock-activate)");
 		if (have_key)
 		{
-			std::printf("wrapping    : %s\n", mk.used_tpm ? "TPM (non-exportable RSA)" : "DPAPI (software)");
-			std::printf("machine pub : ");
-			for (u8 b : mk.pub) std::printf("%02x", b);
-			std::printf("\n");
+			addf(out, "wrapping    : %s\n", mk.used_tpm ? "TPM (non-exportable RSA)" : "DPAPI (software)");
+			addf(out, "machine.pub : ");
+			for (u8 b : mk.pub) addf(out, "%02x", static_cast<unsigned>(b));
+			addf(out, "\n");
 		}
+		addf(out, "config dir  : %s\n\n", config_dir().c_str());
 
 		const std::string config_license = config_dir() + "license.bin";
 		const std::string candidates[2] = {"license.bin", config_license};
@@ -1020,22 +1060,24 @@ namespace ps3lock
 			fs::file lf(candidate);
 			if (!lf)
 			{
-				std::printf("license     : %s not found\n", candidate.c_str());
+				addf(out, "license     : %s  (not found)\n", candidate.c_str());
 				continue;
 			}
 
 			std::vector<u8> blob(lf.size());
 			lf.read(blob.data(), blob.size());
 			const license_info lic = parse_license(blob);
-			std::printf("license     : %s -> %s\n", candidate.c_str(), lic.ok ? "valid signature" : lic.error.c_str());
+			addf(out, "license     : %s  -> %s\n", candidate.c_str(), lic.ok ? "valid signature" : lic.error.c_str());
 			if (lic.ok)
 			{
-				std::printf("recipient   : ");
-				for (u8 b : lic.recipient) std::printf("%02x", b);
-				std::printf("\n");
+				addf(out, "recipient   : ");
+				for (u8 b : lic.recipient) addf(out, "%02x", static_cast<unsigned>(b));
+				addf(out, "\n");
 			}
 		}
-		std::printf("\n");
+		addf(out, "\nThis file is saved as ps3lock-diagnose.txt in the current folder.\n");
+
+		finish_report("ps3lock-diagnose.txt", out);
 		return true;
 #else
 		std::printf("PS3LOCK: not supported on this platform\n");
