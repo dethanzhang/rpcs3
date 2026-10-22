@@ -679,13 +679,22 @@ namespace ps3lock
 			return false;
 		}
 
+		// CNG's BCRYPT_KDF_RAW_SECRET and pycryptodome's ECDH x-coordinate may differ in
+		// byte order (little vs big endian). Try both and keep whichever authenticates.
+		u8 reversed[32];
+		for (int i = 0; i < 32; i++)
+		{
+			reversed[i] = shared[31 - i];
+		}
+
+		u8 h_shared[32];
+		u8 h_reversed[32];
+		hash_sha256(shared, 32, h_shared);
+		hash_sha256(reversed, 32, h_reversed);
+
 		static const u8 kdf_salt[9] = {'P','S','3','L','I','C','-','v','3'};
 		static const u8 kdf_info[13] = {'P','S','3','L','I','C','-','B','O','X','-','v','3'};
-		u8 k[64];
-		hkdf_sha256(shared, 32, kdf_salt, 9, kdf_info, 13, k, sizeof(k));
 
-		const u8* k_enc = k;
-		const u8* k_mac = k + 32;
 		const u8* ct = lic.box.data();
 		const usz ct_len = lic.box.size() - 32;
 		const u8* mac = lic.box.data() + ct_len;
@@ -694,27 +703,43 @@ namespace ps3lock
 		std::memcpy(mac_input, lic.iv, 16);
 		std::memcpy(mac_input + 16, ct, ct_len);
 
-		u8 want[32];
-		hmac_sha256(k_mac, 32, mac_input, 16 + ct_len, want);
+		u8 k[64];
 
-		if (std::memcmp(want, mac, 32) != 0)
+		for (int variant = 0; variant < 2; variant++)
 		{
-			ps3lock_log.error("license box MAC mismatch — license is not for this machine");
-			return false;
+			const u8* secret = variant ? reversed : shared;
+
+			hkdf_sha256(secret, 32, kdf_salt, 9, kdf_info, 13, k, sizeof(k));
+
+			u8 want[32];
+			hmac_sha256(k + 32, 32, mac_input, 16 + ct_len, want);
+
+			if (std::memcmp(want, mac, 32) != 0)
+			{
+				continue;
+			}
+
+			ps3lock_log.notice("license box MAC ok (ECDH secret %s)", variant ? "reversed" : "as-is");
+
+			aes_context ctx;
+			aes_setkey_enc(&ctx, k, 256);
+			u8 plain[48];
+			usz nc_off = 0;
+			u8 nonce_counter[16];
+			u8 stream_block[16] = {};
+			std::memcpy(nonce_counter, lic.iv, 16);
+			aes_crypt_ctr(&ctx, ct_len, &nc_off, nonce_counter, stream_block, ct, plain);
+
+			std::memcpy(k_iso, plain, 32);
+			std::memcpy(iv, plain + 32, 16);
+			return true;
 		}
 
-		aes_context ctx;
-		aes_setkey_enc(&ctx, k_enc, 256);
-		u8 plain[48];
-		usz nc_off = 0;
-		u8 nonce_counter[16];
-		u8 stream_block[16] = {};
-		std::memcpy(nonce_counter, lic.iv, 16);
-		aes_crypt_ctr(&ctx, ct_len, &nc_off, nonce_counter, stream_block, ct, plain);
-
-		std::memcpy(k_iso, plain, 32);
-		std::memcpy(iv, plain + 32, 16);
-		return true;
+		ps3lock_log.error("license box MAC mismatch — tried ECDH secret both byte orders. "
+			"sha256(as-is)=%02x%02x%02x%02x%02x%02x%02x%02x… sha256(reversed)=%02x%02x%02x%02x%02x%02x%02x%02x…",
+			h_shared[0], h_shared[1], h_shared[2], h_shared[3], h_shared[4], h_shared[5], h_shared[6], h_shared[7],
+			h_reversed[0], h_reversed[1], h_reversed[2], h_reversed[3], h_reversed[4], h_reversed[5], h_reversed[6], h_reversed[7]);
+		return false;
 	}
 
 	// ---------------------------------------------------------------- decrypting file
