@@ -50,10 +50,12 @@ env:
   #     → 每次启动弹 "Experimental Build Warning / 正在使用的不是官方版本"
   #   写死成下面的 RPCS3/rpcs3 + master
   #     → git-version-gen.cmd 走 "Assuming master release build" 分支
-  #     → 弹窗消失，标题与官方构建逐字节一致（RPCS3 0.0.43-<commit数>-<hash> | master）
+  #     → 弹窗消失；标题栏显示 "RPCS3 0.0.43-<commit数>-<hash> | 定制版"
+  #       （分支名只在展示层映射成「定制版」，见 rpcs3/rpcs3_version.cpp 的 get_display_branch；
+  #         RPCS3_GIT_FULL_BRANCH 仍是 RPCS3/rpcs3/master，is_release_build() 不受影响）
   #   ⚠️ 代价：is_release_build() 变 true，内置更新器不再把本构建当"非官方"拦下。
-  #      对外发布前请同时做 G4-报告 §7 ①（关闭更新器），否则"检查更新"可能
-  #      把官方 rpcs3.exe 下载覆盖到你的定制 exe 上。
+  #      本仓库已彻底关掉更新器：main_window.cpp 顶部不再定义 RPCS3_UPDATE_SUPPORTED，
+  #      Help 菜单里的"检查更新"项也已从 main_window.ui 删除（不再链官方服务器，也不含任何外链）。
   BUILD_REPOSITORY_NAME: RPCS3/rpcs3
   BUILD_SOURCEBRANCHNAME: master
   BUILD_PR_NUMBER: ${{ github.event.pull_request.number }}

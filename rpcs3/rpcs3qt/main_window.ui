@@ -482,7 +482,6 @@
     </widget>
     <addaction name="languageMenu"/>
     <addaction name="separator"/>
-    <addaction name="updateAct"/>
     <addaction name="welcomeAct"/>
     <addaction name="supportAct"/>
     <addaction name="separator"/>
@@ -912,11 +911,6 @@
    </property>
    <property name="text">
     <string>RAP Files</string>
-   </property>
-  </action>
-  <action name="updateAct">
-   <property name="text">
-    <string>检查定制版更新</string>
    </property>
   </action>
   <action name="downloadIntegrityDbAct">

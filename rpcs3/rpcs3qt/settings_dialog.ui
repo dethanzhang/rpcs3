@@ -4396,18 +4396,6 @@
                 </widget>
                </item>
                <item>
-                <widget class="QGroupBox" name="gb_updates">
-                 <property name="title">
-                  <string>Check for updates on startup</string>
-                 </property>
-                 <layout class="QVBoxLayout" name="layout_gb_updates">
-                  <item>
-                   <widget class="QComboBox" name="combo_updates"/>
-                  </item>
-                 </layout>
-                </widget>
-               </item>
-               <item>
                 <widget class="QGroupBox" name="gb_discord">
                  <property name="title">
                   <string>Discord</string>

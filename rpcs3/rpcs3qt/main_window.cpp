@@ -3563,13 +3563,8 @@ void main_window::CreateConnects()
 		set_cat_count(ui->showCatOtherAct, tr("Other"));
 	});
 
-	connect(ui->updateAct, &QAction::triggered, this, [this]()
-	{
-		// 定制版：不连官方更新服务器（update.rpcs3.net），直接打开我们自己的 Release 页。
-		// 注意：本 lambda 已整体替换掉原来的 #ifdef RPCS3_UPDATE_SUPPORTED / #else 分支，
-		//       与本文件顶部是否定义 RPCS3_UPDATE_SUPPORTED 无关。
-		QDesktopServices::openUrl(QUrl("https://github.com/dethanzhang/rpcs3/releases"));
-	});
+	// 定制版：Help 菜单里的「检查更新」项已在 main_window.ui 中删除，这里对应不再连接任何槽。
+	// （内置更新器本就在本文件顶部被整体禁用，不会再访问 update.rpcs3.net，也不提供外链。）
 
 	connect(ui->downloadIntegrityDbAct, &QAction::triggered, this, [this]()
 	{

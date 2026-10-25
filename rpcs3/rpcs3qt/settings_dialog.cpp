@@ -2054,7 +2054,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		SubscribeTooltip(ui->cb_show_obsolete_cfg_dialog, tooltips.settings.show_obsolete_cfg);
 		SubscribeTooltip(ui->cb_show_same_buttons_dialog, tooltips.settings.show_same_buttons);
 		SubscribeTooltip(ui->cb_show_restart_hint, tooltips.settings.show_restart_hint);
-		SubscribeTooltip(ui->gb_updates, tooltips.settings.check_update_start);
+		// 定制版：内置更新器已整体禁用，GUI 页的「Check for updates on startup」分组已从 .ui 删除。
 		SubscribeTooltip(ui->gb_uuid, tooltips.settings.uuid);
 
 		// Pad navigation
@@ -2167,16 +2167,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		ui->cb_show_same_buttons_dialog->setChecked(m_gui_settings->GetValue(gui::ib_same_buttons).toBool());
 		ui->cb_show_restart_hint->setChecked(m_gui_settings->GetValue(gui::ib_restart_hint).toBool());
 
-		ui->combo_updates->addItem(tr("Yes", "Updates"), gui::update_on);
-		ui->combo_updates->addItem(tr("Background", "Updates"), gui::update_bkg);
-		ui->combo_updates->addItem(tr("Automatic", "Updates"), gui::update_auto);
-		ui->combo_updates->addItem(tr("No", "Updates"), gui::update_off);
-		ui->combo_updates->setCurrentIndex(ui->combo_updates->findData(m_gui_settings->GetValue(gui::m_check_upd_start).toString()));
-		connect(ui->combo_updates, &QComboBox::currentIndexChanged, [this](int index)
-		{
-			if (index >= 0) m_gui_settings->SetValue(gui::m_check_upd_start, ui->combo_updates->itemData(index));
-		});
-
+		// 定制版：不再提供「启动时检查更新」（ui->combo_updates 已从 .ui 删除，更新器也已禁用）。
 		const bool enable_ui_colors = m_gui_settings->GetValue(gui::m_enableUIColors).toBool();
 		ui->cb_custom_colors->setChecked(enable_ui_colors);
 		ui->pb_gl_icon_color->setEnabled(enable_ui_colors);

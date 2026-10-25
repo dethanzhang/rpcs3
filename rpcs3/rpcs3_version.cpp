@@ -30,6 +30,23 @@ namespace rpcs3
 		return version;
 	}
 
+	// 定制版：仅用于「展示」的分支名。
+	// CI 里 BUILD_REPOSITORY_NAME / BUILD_SOURCEBRANCHNAME 被写死成 RPCS3/rpcs3 + master
+	//（为了让 git-version-gen.cmd 走 "Assuming master release build" 分支、不弹「非官方构建」警告），
+	// 于是 RPCS3_GIT_BRANCH 字面上就是 "master"。标题栏/关于框里改成「定制版」更好认。
+	// 注意：只改展示，绝不动 RPCS3_GIT_FULL_BRANCH —— is_release_build() / is_local_build() 依赖它。
+	std::string_view get_display_branch()
+	{
+		const std::string_view branch = get_branch();
+
+		if (branch == "master"sv || branch == "HEAD"sv)
+		{
+			return "定制版"sv;
+		}
+
+		return branch;
+	}
+
 	std::string get_version_and_branch()
 	{
 		// Add branch and commit hash to version on frame unless it's master.
@@ -49,7 +66,7 @@ namespace rpcs3
 
 	std::string get_verbose_version()
 	{
-		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_branch());
+		std::string version = fmt::format("%s | %s", rpcs3::get_version().to_string(), get_display_branch());
 		if (is_local_build())
 		{
 			fmt::append(version, " | local_build");
