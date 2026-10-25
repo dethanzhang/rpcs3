@@ -50,7 +50,7 @@ namespace dimg
 
 	// On-disk magics are stored XOR-masked so they don't show up in `strings` output.
 	static constexpr u8 MAGIC_XOR = 0x5A;
-	static const u8 TAG_MAGIC[8] = {0x0A, 0x09, 0x69, 0x16, 0x19, 0x11, 0x6A, 0x69};
+	static const u8 TAG_MAGIC_MASKED[8] = {0x0A, 0x09, 0x69, 0x16, 0x19, 0x11, 0x6A, 0x69};
 
 	static bool magic_is(const u8* data, const u8* masked, usz n)
 	{
@@ -65,9 +65,9 @@ namespace dimg
 	}
 
 #ifdef _WIN32
-	static const u8 LICENSE_MAGIC[8] = {0x0A, 0x09, 0x69, 0x16, 0x13, 0x19, 0x6A, 0x6E};
-	static const u8 REQUEST_MAGIC[4] = {0x0A, 0x69, 0x08, 0x0B};
-	static const u8 BUNDLE_MAGIC[4]  = {0x0A, 0x69, 0x08, 0x02};
+	static const u8 LICENSE_MAGIC_MASKED[8] = {0x0A, 0x09, 0x69, 0x16, 0x13, 0x19, 0x6A, 0x6E};
+	static const u8 REQUEST_MAGIC_MASKED[4] = {0x0A, 0x69, 0x08, 0x0B};
+	static const u8 BUNDLE_MAGIC_MASKED[4]  = {0x0A, 0x69, 0x08, 0x02};
 
 	static void magic_put(u8* dst, const u8* masked, usz n)
 	{
@@ -716,7 +716,7 @@ namespace dimg
 	static license_info parse_license(const std::vector<u8>& blob)
 	{
 		license_info info;
-		if (blob.size() != LIC_HDR_LEN + TAG_SIZE + LIC_SIG_LEN || !magic_is(blob.data(), LICENSE_MAGIC, 8))
+		if (blob.size() != LIC_HDR_LEN + TAG_SIZE + LIC_SIG_LEN || !magic_is(blob.data(), LICENSE_MAGIC_MASKED, 8))
 		{
 			info.error = "授权数据格式不符（E1）";
 			return info;
@@ -1072,7 +1072,7 @@ namespace dimg
 		}
 
 		u8 header_magic[4];
-		magic_put(header_magic, BUNDLE_MAGIC, 4);
+		magic_put(header_magic, BUNDLE_MAGIC_MASKED, 4);
 
 		std::string head(reinterpret_cast<const char*>(header_magic), sizeof(header_magic));
 		head += static_cast<char>(1);   // version
@@ -1104,7 +1104,7 @@ namespace dimg
 			return false;
 		}
 
-		return magic_is(tag, TAG_MAGIC, sizeof(TAG_MAGIC));
+		return magic_is(tag, TAG_MAGIC_MASKED, sizeof(TAG_MAGIC_MASKED));
 	}
 
 	fs::file open_maybe_locked(const std::string& path, bs_t<fs::open_mode> mode)
@@ -1295,7 +1295,7 @@ namespace dimg
 			}
 
 			u8 request[REQ_LEN] = {};
-			std::memcpy(request, REQUEST_MAGIC, 4);
+			magic_put(request, REQUEST_MAGIC_MASKED, 4);
 			request[4] = static_cast<u8>(REQ_VER);
 			std::memcpy(request + 8, mk.modulus, RSA_BYTES);
 
