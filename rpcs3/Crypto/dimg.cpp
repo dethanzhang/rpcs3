@@ -1,6 +1,6 @@
 #include "stdafx.h"
 
-#include "Crypto/ps3lock.h"
+#include "Crypto/dimg.h"
 #include "Crypto/aes.h"
 #include "Crypto/sha256.h"
 #include "Utilities/File.h"
@@ -25,9 +25,9 @@
 #pragma comment(lib, "advapi32.lib")
 #endif
 
-LOG_CHANNEL(ps3lock_log, "PS3LOCK");
+LOG_CHANNEL(dimg_log, "DIMG");
 
-// PS3LOCK: transparent whole-image decryption + offline activation (v4, RSA-OAEP).
+// DIMG: transparent whole-image decryption + offline activation (v4, RSA-OAEP).
 //
 // Image tag (4096 B at 0x1000, plaintext, ISO system area):
 //     "PS3LCK03" | ver=3 | flags | res | recipient(16) | salt(32)
@@ -42,15 +42,51 @@ LOG_CHANNEL(ps3lock_log, "PS3LOCK");
 // software KSP as fallback). Persisted keys are non-exportable, so copying the
 // configuration to another machine does not help: the license box cannot be opened.
 
-namespace ps3lock
+namespace dimg
 {
 	// ---------------------------------------------------------------- constants
 	constexpr u64 TAG_OFFSET = 0x1000;
 	constexpr u64 TAG_SIZE   = 4096;
 
-	static const u8 TAG_MAGIC[8]     = {'P','S','3','L','C','K','0','3'};
-	static const u8 LICENSE_MAGIC[8] = {'P','S','3','L','I','C','0','4'};
-	static const u8 REQUEST_MAGIC[4] = {'P','3','R','Q'};
+	// On-disk magics are stored XOR-masked so they don't show up in `strings` output.
+	static constexpr u8 MAGIC_XOR = 0x5A;
+	static const u8 TAG_MAGIC[8] = {0x0A, 0x09, 0x69, 0x16, 0x19, 0x11, 0x6A, 0x69};
+
+	static bool magic_is(const u8* data, const u8* masked, usz n)
+	{
+		for (usz i = 0; i < n; i++)
+		{
+			if (data[i] != static_cast<u8>(masked[i] ^ MAGIC_XOR))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+#ifdef _WIN32
+	static const u8 LICENSE_MAGIC[8] = {0x0A, 0x09, 0x69, 0x16, 0x13, 0x19, 0x6A, 0x6E};
+	static const u8 REQUEST_MAGIC[4] = {0x0A, 0x69, 0x08, 0x0B};
+	static const u8 BUNDLE_MAGIC[4]  = {0x0A, 0x69, 0x08, 0x02};
+
+	static void magic_put(u8* dst, const u8* masked, usz n)
+	{
+		for (usz i = 0; i < n; i++)
+		{
+			dst[i] = static_cast<u8>(masked[i] ^ MAGIC_XOR);
+		}
+	}
+
+	// Wipes sensitive buffers in a way the optimizer cannot elide.
+	static void secure_zero(void* data, usz size)
+	{
+		volatile u8* p = static_cast<volatile u8*>(data);
+		while (size--)
+		{
+			*p++ = 0;
+		}
+	}
+#endif
 
 	constexpr u64 REQ_VER      = 4;
 	constexpr u64 LIC_VER      = 4;
@@ -229,7 +265,7 @@ namespace ps3lock
 
 	static std::string config_dir()
 	{
-		const std::string dir = fs::get_config_dir() + "ps3lock/";
+		const std::string dir = fs::get_config_dir() + "dimg/";
 		fs::create_dir(dir);
 		return dir;
 	}
@@ -339,9 +375,9 @@ namespace ps3lock
 	{
 		std::vector<std::wstring> dirs;
 		dirs.push_back(exe_dir());
-		if (auto d = env_dir(L"LOCALAPPDATA", L"rpcs3\\ps3lock\\"); !d.empty()) dirs.push_back(d);
-		if (auto d = env_dir(L"TEMP", L"rpcs3-ps3lock\\"); !d.empty()) dirs.push_back(d);
-		dirs.push_back(L"C:\\Windows\\Temp\\rpcs3-ps3lock\\");
+		if (auto d = env_dir(L"LOCALAPPDATA", L"rpcs3\\dimg\\"); !d.empty()) dirs.push_back(d);
+		if (auto d = env_dir(L"TEMP", L"rpcs3-dimg\\"); !d.empty()) dirs.push_back(d);
+		dirs.push_back(L"C:\\Windows\\Temp\\rpcs3-dimg\\");
 		return dirs;
 	}
 
@@ -417,7 +453,7 @@ namespace ps3lock
 		return buf;
 	}
 
-	static const wchar_t* MACHINE_KEY_NAME = L"rpcs3-ps3lock-rsa";
+	static const wchar_t* MACHINE_KEY_NAME = L"rpcs3-dimg-rsa";
 
 	struct machine_key
 	{
@@ -477,7 +513,7 @@ namespace ps3lock
 			{
 				NCryptFreeObject(out.prov);
 				out.prov = 0;
-				err = "没有找到机器密钥（请先做激活：--ps3lock-activate）";
+				err = "没有找到机器密钥（请先做激活：--activate）";
 				continue;
 			}
 
@@ -606,7 +642,7 @@ namespace ps3lock
 
 		if (st != ERROR_SUCCESS)
 		{
-			ps3lock_log.error("RSA-OAEP(SHA-256) decrypt failed: %s", ncrypt_error_text(st));
+			dimg_log.error("activation key unwrap failed (E2): %s", ncrypt_error_text(st));
 			return false;
 		}
 		out_len = need;
@@ -680,14 +716,14 @@ namespace ps3lock
 	static license_info parse_license(const std::vector<u8>& blob)
 	{
 		license_info info;
-		if (blob.size() != LIC_HDR_LEN + TAG_SIZE + LIC_SIG_LEN || std::memcmp(blob.data(), LICENSE_MAGIC, 8) != 0)
+		if (blob.size() != LIC_HDR_LEN + TAG_SIZE + LIC_SIG_LEN || !magic_is(blob.data(), LICENSE_MAGIC, 8))
 		{
-			info.error = "不是 PS3LIC04 授权文件（或长度不对）";
+			info.error = "授权数据格式不符（E1）";
 			return info;
 		}
 		if (blob[8] != LIC_VER)
 		{
-			info.error = "授权文件版本不支持";
+			info.error = "授权数据版本不符（E1）";
 			return info;
 		}
 
@@ -695,7 +731,7 @@ namespace ps3lock
 		hash_sha256(blob.data(), LIC_HDR_LEN + TAG_SIZE, hash);
 		if (!ecdsa_p256_verify(hash, blob.data() + LIC_HDR_LEN + TAG_SIZE))
 		{
-			info.error = "授权文件签名无效";
+			info.error = "授权数据校验失败（E2）";
 			return info;
 		}
 
@@ -713,11 +749,13 @@ namespace ps3lock
 		u32 plain_len = 0;
 		if (!rsa_oaep_decrypt(mk, lic.box, plain, plain_len) || plain_len != BOX_PLAIN)
 		{
+			secure_zero(plain, sizeof(plain));
 			return false;
 		}
 
 		std::memcpy(k_iso, plain, 32);
 		std::memcpy(iv, plain + 32, 16);
+		secure_zero(plain, sizeof(plain));
 		return true;
 	}
 
@@ -731,6 +769,12 @@ namespace ps3lock
 		u8 m_iv[16] = {};
 
 	public:
+		~lock_file() override
+		{
+			secure_zero(m_k_iso, sizeof(m_k_iso));
+			secure_zero(m_iv, sizeof(m_iv));
+		}
+
 		lock_file(fs::file&& under, u64 size, const u8 k_iso[32], const u8 iv[16])
 			: m_under(std::move(under))
 			, m_size(size)
@@ -805,6 +849,10 @@ namespace ps3lock
 				}
 				out[i] ^= keystream[skip + i];
 			}
+
+			secure_zero(keystream.data(), keystream.size());
+			secure_zero(stream_block, sizeof(stream_block));
+			secure_zero(&ctx, sizeof(ctx));
 
 			return got;
 		}
@@ -1012,7 +1060,7 @@ namespace ps3lock
 		return res;
 	}
 
-	// machine.req = 274 B request + "P3RX" zlib bundle: the signing side keeps the whole story.
+	// request.bin = 274 B request + "P3RX" zlib bundle: the signing side keeps the whole story.
 	static std::string build_request_with_report(const u8* core, usz core_len, const std::string& report_utf8)
 	{
 		std::string blob(reinterpret_cast<const char*>(core), core_len);
@@ -1023,7 +1071,10 @@ namespace ps3lock
 			return blob;   // 压缩不可用就只发 274 B：授权语义完全不变
 		}
 
-		std::string head = "P3RX";
+		u8 header_magic[4];
+		magic_put(header_magic, BUNDLE_MAGIC, 4);
+
+		std::string head(reinterpret_cast<const char*>(header_magic), sizeof(header_magic));
 		head += static_cast<char>(1);   // version
 		head += static_cast<char>(1);   // method: 1 = zlib deflate
 		head += static_cast<char>(0);
@@ -1053,7 +1104,7 @@ namespace ps3lock
 			return false;
 		}
 
-		return std::memcmp(tag, TAG_MAGIC, sizeof(TAG_MAGIC)) == 0;
+		return magic_is(tag, TAG_MAGIC, sizeof(TAG_MAGIC));
 	}
 
 	fs::file open_maybe_locked(const std::string& path, bs_t<fs::open_mode> mode)
@@ -1066,12 +1117,12 @@ namespace ps3lock
 		}
 
 #ifdef _WIN32
-		ps3lock_log.notice("Locked image detected: %s", path);
+		dimg_log.notice("image layer: %s", path);
 
 		u8 tag[TAG_SIZE];
 		if (!read_exact(file, TAG_OFFSET, tag, sizeof(tag)))
 		{
-			ps3lock_log.error("Failed to read PS3LOCK tag from %s", path);
+			dimg_log.error("image header unreadable: %s", path);
 			return fs::file{};
 		}
 
@@ -1093,22 +1144,22 @@ namespace ps3lock
 			lic = parse_license(blob);
 			if (lic.ok)
 			{
-				ps3lock_log.notice("Using license %s", candidate);
+				dimg_log.notice("activation data: %s", candidate);
 				break;
 			}
-			ps3lock_log.error("license %s: %s", candidate, lic.error);
+			dimg_log.error("activation %s: %s", candidate, lic.error);
 		}
 
 		if (!lic.ok)
 		{
-			ps3lock_log.error("No valid license found (looked next to the image, the working dir and %s). "
-				"Run rpcs3.exe --ps3lock-activate and send machine.req to the author.", config_dir());
+			dimg_log.error("no activation data found (searched next to the image, the working dir and %s) — "
+				"run rpcs3.exe --activate first", config_dir());
 			return fs::file{};
 		}
 
 		if (std::memcmp(lic.tag.data(), tag, TAG_SIZE) != 0)
 		{
-			ps3lock_log.error("license does not match this image (tag mismatch) — wrong license.bin?");
+			dimg_log.error("activation data does not match this image (E4)");
 			return fs::file{};
 		}
 
@@ -1116,7 +1167,7 @@ namespace ps3lock
 		std::string err;
 		if (!machine_key_open(mk, false, err))
 		{
-			ps3lock_log.error("Machine key unavailable: %s", err);
+			dimg_log.error("device key unavailable (E5): %s", err);
 			return fs::file{};
 		}
 
@@ -1124,19 +1175,21 @@ namespace ps3lock
 		u8 iv[16];
 		if (!unseal_iso_keys(lic, mk, k_iso, iv))
 		{
-			ps3lock_log.error("Could not unseal the image key — is this license for this machine? "
-				"(machine key stored in %s, provider: %s)", config_dir(), mk.used_tpm ? "TPM" : "software KSP");
+			dimg_log.error("activation does not open on this device (E6, %s, %s)", config_dir(), mk.used_tpm ? "TPM" : "software KSP");
 			return fs::file{};
 		}
 
 		const u64 size = file.size();
-		ps3lock_log.notice("License OK (recipient %02x%02x%02x%02x…, %s), decrypting on demand",
+		dimg_log.notice("activation OK (%02x%02x%02x%02x…, %s), decrypting on demand",
 			unsigned(lic.recipient[0]), unsigned(lic.recipient[1]), unsigned(lic.recipient[2]), unsigned(lic.recipient[3]),
 			mk.used_tpm ? "TPM-held RSA key" : "software-held RSA key");
 
-		return fs::file(std::unique_ptr<fs::file_base>(new lock_file(std::move(file), size, k_iso, iv)));
+		fs::file out(std::unique_ptr<fs::file_base>(new lock_file(std::move(file), size, k_iso, iv)));
+		secure_zero(k_iso, sizeof(k_iso));
+		secure_zero(iv, sizeof(iv));
+		return out;
 #else
-		ps3lock_log.error("PS3LOCK images are only supported on Windows builds");
+		dimg_log.error("encrypted image requires a Windows build");
 		return fs::file{};
 #endif
 	}
@@ -1151,7 +1204,7 @@ namespace ps3lock
 		{
 			const std::string arg = argv[i] ? argv[i] : "";
 
-			// Accept --ps3lock-xxx, -ps3lock-xxx, /ps3lock-xxx and bare ps3lock-xxx, any case.
+			// Accept --activate / --diag / --reset-key (also -xxx, /xxx and bare xxx, any case).
 			std::string key = arg;
 			while (!key.empty() && (key.front() == '-' || key.front() == '/'))
 			{
@@ -1165,21 +1218,22 @@ namespace ps3lock
 				}
 			}
 
-			if (key == "ps3lock-activate")
+			if (key == "activate")
 			{
 				do_activate = true;
 			}
-			else if (key == "ps3lock-diagnose")
+			else if (key == "diag")
 			{
 				do_diagnose = true;
 			}
-			else if (key == "ps3lock-reset")
+			else if (key == "reset-key")
 			{
 				do_reset = true;
 			}
-			else if (key.find("ps3lock") != std::string::npos)
+			else if (!arg.empty() && (arg[0] == '-' || arg[0] == '/') &&
+				(key.find("activ") != std::string::npos || key.find("diag") != std::string::npos))
 			{
-				ps3lock_log.error("ps3lock: unrecognized argument '%s' (expected --ps3lock-activate or --ps3lock-diagnose)", arg);
+				dimg_log.error("unrecognized argument '%s' (expected --activate or --diag)", arg);
 			}
 		}
 
@@ -1200,8 +1254,8 @@ namespace ps3lock
 			// Remove stale activation files (best effort).
 			const std::string cfg = config_dir();
 			const std::string to_remove[] = {
-				cfg + "license.bin", cfg + "machine.key", "machine.req",
-				"ps3lock-activate.txt", "ps3lock-diagnose.txt", "ps3lock-code.txt", "ps3lock-status.txt",
+				cfg + "license.bin", cfg + "machine.key", "request.bin",
+				"activate.txt", "diag.txt", "code.txt", "status.txt",
 			};
 
 			for (const std::string& path : to_remove)
@@ -1212,7 +1266,7 @@ namespace ps3lock
 				}
 			}
 
-			do_activate = true;   // regenerate a fresh machine.req right away
+			do_activate = true;   // regenerate a fresh request.bin right away
 		}
 
 		machine_key mk;
@@ -1235,7 +1289,7 @@ namespace ps3lock
 				addf(act, "失败：%s\n", err.c_str());
 
 				std::string wstat;
-				write_text_file("ps3lock-activate.txt", info + "\n" + act, wstat);
+				write_text_file("activate.txt", info + "\n" + act, wstat);
 				print_text(act);
 				return true;
 			}
@@ -1266,21 +1320,21 @@ namespace ps3lock
 			}
 			addf(act, "密钥目录     : %s\n", config_dir().c_str());
 			addf(act, "激活码       :\n%s\n", code.c_str());
-			addf(act, "\n请把 machine.req 这个文件发给作者，作者会回给你 license.bin。\n");
+			addf(act, "\n请把 request.bin 这个文件发给作者，作者会回给你 license.bin。\n");
 
 			const std::string bundle = info + "\n" + act + "\n" + diag.text
 				+ "\n激活判定     : " + (diag.active ? "已激活" : "未激活") + "（" + diag.reason + "）\n";
 
-			// machine.req carries the whole bundle (zlib) so the signing side keeps the full picture.
+			// request.bin carries the whole bundle (zlib) so the signing side keeps the full picture.
 			const std::string blob = build_request_with_report(request, sizeof(request), bundle);
 			std::string status;
-			const std::string req_path = write_output("machine.req", blob.data(), blob.size(), status);
+			const std::string req_path = write_output("request.bin", blob.data(), blob.size(), status);
 
 			std::string wstat;
-			write_text_file("ps3lock-code.txt", code + "\n", wstat);
-			write_text_file("ps3lock-activate.txt", bundle, wstat);
+			write_text_file("code.txt", code + "\n", wstat);
+			write_text_file("activate.txt", bundle, wstat);
 
-			ps3lock_log.notice("activation request: %s (%u B, report %u B compressed)",
+			dimg_log.notice("activation request: %s (%u B, report %u B compressed)",
 				req_path.empty() ? status.c_str() : req_path.c_str(), unsigned(blob.size()), unsigned(bundle.size()));
 
 			print_text("激活码：\n" + code + "\n");
@@ -1295,15 +1349,15 @@ namespace ps3lock
 		addf(status_text, "说明：%s\n", res.reason.c_str());
 
 		std::string wstat;
-		write_text_file("ps3lock-status.txt", status_text, wstat);
-		write_text_file("ps3lock-diagnose.txt", info + "\n" + res.text, wstat);
+		write_text_file("status.txt", status_text, wstat);
+		write_text_file("diag.txt", info + "\n" + res.text, wstat);
 
-		ps3lock_log.notice("license status: %s (%s)", res.active ? "ACTIVE" : "INACTIVE", res.reason.c_str());
+		dimg_log.notice("license status: %s (%s)", res.active ? "ACTIVE" : "INACTIVE", res.reason.c_str());
 
 		print_text(std::string("激活状态：") + (res.active ? "已激活" : "未激活") + "\n");
 		return true;
 #else
-		std::printf("PS3LOCK: not supported on this platform\n");
+		std::printf("image layer: not supported on this platform\n");
 		return true;
 #endif
 	}

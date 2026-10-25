@@ -17,7 +17,7 @@
 #include <QStandardPaths>
 
 #include "rpcs3qt/gui_application.h"
-#include "Crypto/ps3lock.h"
+#include "Crypto/dimg.h"
 #include "rpcs3qt/fatal_error_dialog.h"
 #include "rpcs3qt/curl_handle.h"
 #include "rpcs3qt/main_window.h"
@@ -563,8 +563,8 @@ void run_platform_sanity_checks()
 
 int run_rpcs3(int argc, char** argv)
 {
-	// PS3LOCK: handle --ps3lock-activate / --ps3lock-diagnose before anything else
-	if (ps3lock::handle_command_line(argc, argv))
+	// Handle --activate / --diag / --reset-key before anything else.
+	if (dimg::handle_command_line(argc, argv))
 	{
 		return 0;
 	}
