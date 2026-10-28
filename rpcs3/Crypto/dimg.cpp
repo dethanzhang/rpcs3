@@ -112,10 +112,13 @@ namespace dimg
 	constexpr u64 PUB_LEN      = 65;               // issuer pubkey, uncompressed
 	constexpr u64 REQ_LEN      = 4 + 4 + RSA_BYTES + 8 + 2;    // 274
 
-	// Issuer public key (ECDSA P-256). Replace only together with keys/issuer.key.
+	#ifdef _WIN32
+	// Windows 档的 issuer 公钥（ECDSA P-256）。换签发密钥时同步改这里。
+	// POSIX 档用下面的 ISSUER_PUB_DECK（两档故意分开）。
 	static const u8 ISSUER_PUB[PUB_LEN] = {
 		0x04, 0x69, 0x26, 0x60, 0x08, 0xCC, 0xB4, 0x4A, 0x2E, 0x4A, 0xC1, 0x99, 0x0A, 0xCA, 0x09, 0x0F, 0xD9, 0xD7, 0xA1, 0x75, 0x7A, 0xA9, 0x40, 0x30, 0x78, 0xAD, 0x64, 0x7E, 0x20, 0xA6, 0xD8, 0x53, 0xCA, 0xA0, 0xCE, 0x84, 0x2D, 0x01, 0xA4, 0x35, 0x4B, 0x08, 0x7B, 0x7D, 0x04, 0x98, 0x61, 0xEB, 0x64, 0xDE, 0xA6, 0x8C, 0x3A, 0x56, 0xDF, 0x87, 0xBE, 0x09, 0xC9, 0x05, 0xA2, 0x2C, 0xFB, 0x84, 0x9D
 	};
+	#endif
 
 	// ---------------------------------------------------------------- sha256 / hmac / hkdf
 	static void hash_sha256(const void* data, usz size, u8 out[32])
@@ -196,7 +199,9 @@ namespace dimg
 	}
 
 	// ---------------------------------------------------------------- image key derivation
-	static void derive_iso_keys(const u8* tag, u8 k_iso[32], u8 iv[16])
+	// 注意：客户端**从不**自己派生 K_iso（它只从 license 的 RSA-OAEP 匣子里解出来）。
+	// 这个函数保留给出包侧自测 / 将来排查用。
+	[[maybe_unused]] static void derive_iso_keys(const u8* tag, u8 k_iso[32], u8 iv[16])
 	{
 		static const u8 kdf_salt[9] = {'P','S','3','I','S','O','-','v','2'};
 		static const u8 info_key[17] = {'P','S','3','I','S','O','-','I','S','O','-','K','E','Y','-','v','2'};
@@ -232,7 +237,7 @@ namespace dimg
 			crc ^= data[i];
 			for (int b = 0; b < 8; b++)
 			{
-				crc = (crc & 1) ? (u16)((crc >> 1) ^ 0xA001) : (u16)(crc >> 1);
+				crc = (crc & 1) ? static_cast<u16>((crc >> 1) ^ 0xA001) : static_cast<u16>(crc >> 1);
 			}
 		}
 		return crc;
@@ -796,22 +801,6 @@ namespace dimg
 		}
 		::chmod(path.c_str(), S_IRUSR | S_IWUSR);
 		return true;
-	}
-
-	static void mkdir_p(const std::string& dir)
-	{
-		std::string cur;
-		for (usz i = 0; i <= dir.size(); i++)
-		{
-			if (i == dir.size() || dir[i] == '/')
-			{
-				if (i)
-				{
-					cur = dir.substr(0, i);
-					::mkdir(cur.c_str(), S_IRWXU);
-				}
-			}
-		}
 	}
 
 	static std::string trim_copy(std::string s)
