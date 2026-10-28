@@ -100,6 +100,13 @@ jobs:
               /rpcs3/.ci/build-linux.sh
             '
 
+      # docker 容器里是以 root 跑的，AppImage 被 cp 进 artifacts/ 后归 root 所有，
+      # 后面的 GPL 源码打包 / SHA256SUMS 都是非 root 用户，必须先把属主改回来。
+      - name: Fix artifact ownership (container ran as root)
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}" || true
+
       - name: List artifacts
         if: always()
         run: |
