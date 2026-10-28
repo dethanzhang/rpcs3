@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <algorithm>
 #include <iterator>
 
@@ -23,6 +24,21 @@
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ncrypt.lib")
 #pragma comment(lib, "advapi32.lib")
+#else
+// POSIX（Linux / Steam Deck）：只借 OpenSSL 做 RSA-OAEP 解封 + ECDSA-P256 验签，
+// AES-CTR 用本目录的 aes.cpp（含 AES-NI 路径）。OPENSSL_API_COMPAT 把 1.1 时代 API
+// 标成“未弃用”，避免被 -Werror=deprecated-declarations 拦下。
+#define OPENSSL_API_COMPAT 0x10100000L
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#include <openssl/rand.h>
+#include <openssl/x509.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <ctime>
+#include <cstdlib>
 #endif
 
 LOG_CHANNEL(dimg_log, "DIMG");
@@ -49,6 +65,7 @@ namespace dimg
 	constexpr u64 TAG_SIZE   = 4096;
 
 	// On-disk magics are stored XOR-masked so they don't show up in `strings` output.
+	// （这些常量和 secure_zero 两个平台都要用 —— POSIX 侧同样要伪造 request/license。）
 	static constexpr u8 MAGIC_XOR = 0x5A;
 	static const u8 TAG_MAGIC_MASKED[8] = {0x0A, 0x09, 0x69, 0x16, 0x19, 0x11, 0x6A, 0x69};
 
@@ -64,7 +81,6 @@ namespace dimg
 		return true;
 	}
 
-#ifdef _WIN32
 	static const u8 LICENSE_MAGIC_MASKED[8] = {0x0A, 0x09, 0x69, 0x16, 0x13, 0x19, 0x6A, 0x6E};
 	static const u8 REQUEST_MAGIC_MASKED[4] = {0x0A, 0x69, 0x08, 0x0B};
 	static const u8 BUNDLE_MAGIC_MASKED[4]  = {0x0A, 0x69, 0x08, 0x02};
@@ -86,7 +102,6 @@ namespace dimg
 			*p++ = 0;
 		}
 	}
-#endif
 
 	constexpr u64 REQ_VER      = 4;
 	constexpr u64 LIC_VER      = 4;
@@ -150,30 +165,34 @@ namespace dimg
 
 	static void hkdf_sha256(const u8* ikm, usz n, const u8* salt, usz sn, const u8* info, usz in, u8* out, usz on)
 	{
+		// HKDF-SHA256（RFC 5869）：先 Extract 出 prk，再逐块 Expand。
+		// 注意：Expand 的每一块必须是 HMAC(prk, ...)，不是裸 SHA-256。
 		u8 prk[32];
 		hmac_sha256(salt, sn, ikm, n, prk);
 
 		u8 t[32] = {};
-		usz tlen = 0, done = 0;
+		usz tlen = 0;
+		usz done = 0;
 		u8 ctr = 1;
 
 		while (done < on)
 		{
-			mbedtls_sha256_context ctx;
-			mbedtls_sha256_init(&ctx);
-			mbedtls_sha256_starts_ret(&ctx, 0);
-			mbedtls_sha256_update_ret(&ctx, t, tlen);
-			mbedtls_sha256_update_ret(&ctx, info, in);
-			mbedtls_sha256_update_ret(&ctx, &ctr, 1);
-			mbedtls_sha256_finish_ret(&ctx, t);
-			mbedtls_sha256_free(&ctx);
+			std::vector<u8> msg(tlen + in + 1);
+			std::memcpy(msg.data(), t, tlen);
+			std::memcpy(msg.data() + tlen, info, in);
+			msg[tlen + in] = ctr;
 
-			tlen = 32;
-			const usz take = std::min<usz>(32, on - done);
+			hmac_sha256(prk, sizeof(prk), msg.data(), msg.size(), t);
+			tlen = sizeof(t);
+
+			const usz take = std::min<usz>(sizeof(t), on - done);
 			std::memcpy(out + done, t, take);
 			done += take;
 			ctr++;
 		}
+
+		secure_zero(prk, sizeof(prk));
+		secure_zero(t, sizeof(t));
 	}
 
 	// ---------------------------------------------------------------- image key derivation
@@ -649,6 +668,22 @@ namespace dimg
 		return true;
 	}
 
+	static u64 hwid_hash8()
+	{
+		DWORD serial = 0;
+		GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0);
+		char name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+		DWORD name_len = sizeof(name);
+		GetComputerNameA(name, &name_len);
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "%08lX-%s", static_cast<unsigned long>(serial), name);
+		u8 digest[32];
+		hash_sha256(buf, std::strlen(buf), digest);
+		u64 v = 0;
+		for (int i = 0; i < 8; i++) v = (v << 8) | digest[i];
+		return v;
+	}
+
 	static bool ecdsa_p256_verify(const u8* hash32, const u8* sig64)
 	{
 		BCRYPT_ALG_HANDLE alg = nullptr;
@@ -673,21 +708,709 @@ namespace dimg
 		return ok;
 	}
 
+#else
+	// ---------------------------------------------------------------- POSIX（Linux / Steam Deck）
+	//
+	// 机器绑定用「指纹派生的 KEK 加密私钥文件」，不依赖 TPM：
+	//   ikm     = HMAC-SHA256("dimg-uuid-v1", product_uuid || 0x00 || product_name)
+	//   KEK     = HKDF-SHA256(ikm, "dimg-mk-v1", "machine-key")        // 加密私钥
+	//   MAC_KEY = HKDF-SHA256(ikm, "dimg-mk-v1", "machine-key-mac")    // 整文件完整性
+	// ⇒ 把 ~/.config/rpcs3/dimg/ 拷到另一台 Deck 解不开（指纹不同）。
+	// 注意：UUID 是公开信息，所以 **UUID 不进 machine.key.enc，也不进日志**（request.bin 例外）。
+
+	// 平台档：本二进制只认 Steam Deck 档（tag[9] == 1）
+	constexpr u8 PROFILE_PLATFORM = 1;
+
+	// 前置声明：license 段在下面（两平台共用），这里的报告/诊断函数要引用
+	struct machine_key;
+	struct license_info;
+	static std::vector<std::string> license_candidates(const std::string& image_path);
+	static license_info parse_license(const std::vector<u8>& blob);
+	static bool unseal_iso_keys(const license_info& lic, machine_key& mk, u8 k_iso[32], u8 iv[16]);
+
+	// keys/issuer/deck/issuer.pub（65B，uncompressed P-256）；换签发密钥时同步改这里
+	static const u8 ISSUER_PUB_DECK[PUB_LEN] = {
+		0x04, 0x11, 0x9B, 0xAD, 0x11, 0x6C, 0x37, 0x82, 0xC3, 0x53, 0xD3, 0xBE, 0x86, 0xA5, 0x9C, 0xEB,
+		0xA0, 0xBD, 0x55, 0xD5, 0xB8, 0xE6, 0x31, 0x8F, 0xA3, 0x68, 0xA1, 0x02, 0xE1, 0xCE, 0x34, 0x3F,
+		0xD5, 0x68, 0x8F, 0xE1, 0x14, 0xC0, 0x7A, 0x15, 0x5E, 0x6C, 0x92, 0xF1, 0xC3, 0xB5, 0x90, 0x9B,
+		0xC5, 0x43, 0x2A, 0xC6, 0x9C, 0x2B, 0x13, 0x1C, 0xD0, 0x10, 0x3A, 0xA8, 0x47, 0x57, 0xA3, 0xFE,
+		0x48
+	};
+
+	struct machine_key
+	{
+		bool valid = false;
+		bool used_tpm = false;          // POSIX 侧永远是软件密钥（以后接 tpm2-tss 再打开）
+		std::vector<u8> der;            // PKCS#1 私钥 DER，用完擦
+		u8 modulus[RSA_BYTES] = {};
+		std::string note;
+	};
+
+	// ---------------------------------------------------------------- 文件小工具
+	static bool read_file_bytes(const std::string& path, std::vector<u8>& out)
+	{
+		std::FILE* f = std::fopen(path.c_str(), "rb");
+		if (!f)
+		{
+			return false;
+		}
+		std::fseek(f, 0, SEEK_END);
+		const long n = std::ftell(f);
+		std::fseek(f, 0, SEEK_SET);
+		if (n < 0)
+		{
+			std::fclose(f);
+			return false;
+		}
+		out.resize(static_cast<usz>(n));
+		const usz got = out.empty() ? 0 : std::fread(out.data(), 1, out.size(), f);
+		std::fclose(f);
+		return got == out.size();
+	}
+
+	static bool file_exists(const std::string& path)
+	{
+		std::FILE* f = std::fopen(path.c_str(), "rb");
+		if (!f)
+		{
+			return false;
+		}
+		std::fclose(f);
+		return true;
+	}
+
+	static bool write_file_bytes(const std::string& path, const void* data, usz size, std::string& err)
+	{
+		std::FILE* f = std::fopen(path.c_str(), "wb");
+		if (!f)
+		{
+			err = "打不开 " + path;
+			return false;
+		}
+		const bool ok = size == 0 || std::fwrite(data, 1, size, f) == size;
+		std::fclose(f);
+		if (!ok)
+		{
+			err = "写不进去 " + path;
+			return false;
+		}
+		::chmod(path.c_str(), S_IRUSR | S_IWUSR);
+		return true;
+	}
+
+	static void mkdir_p(const std::string& dir)
+	{
+		std::string cur;
+		for (usz i = 0; i <= dir.size(); i++)
+		{
+			if (i == dir.size() || dir[i] == '/')
+			{
+				if (i)
+				{
+					cur = dir.substr(0, i);
+					::mkdir(cur.c_str(), S_IRWXU);
+				}
+			}
+		}
+	}
+
+	static std::string trim_copy(std::string s)
+	{
+		while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+		while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+		return s;
+	}
+
+	static std::string read_text_trimmed(const std::string& path)
+	{
+		std::vector<u8> b;
+		if (!read_file_bytes(path, b))
+		{
+			return {};
+		}
+		return trim_copy(std::string(b.begin(), b.end()));
+	}
+
+	// ---------------------------------------------------------------- 机器指纹
+	static std::string dmi_field(const char* name)
+	{
+		return read_text_trimmed(std::string("/sys/class/dmi/id/") + name);
+	}
+
+	// 只用固件层、与系统盘/SD 卡无关的两项。UUID 全 0 或 AMI 默认值 → 不可用（E7）。
+	static bool machine_fingerprint(std::string& uuid, std::string& name, std::string& err)
+	{
+#ifdef DIMG_SELFTEST_FINGERPRINT
+		// 只有 tools/deck_port 的离线自测会定义这个宏；正式构建里不存在，避免变成绕过指纹的开关
+		if (const char* u = std::getenv("DIMG_TEST_UUID"))
+		{
+			uuid = u;
+			name = std::getenv("DIMG_TEST_PRODUCT") ? std::getenv("DIMG_TEST_PRODUCT") : "Jupiter";
+			return true;
+		}
+#endif
+		uuid = dmi_field("product_uuid");
+		name = dmi_field("product_name");
+
+		if (uuid.size() != 36)
+		{
+			err = "读不到 /sys/class/dmi/id/product_uuid（需要 BIOS 暴露 SMBIOS UUID）";
+			return false;
+		}
+		for (const char* bad : {"00000000-0000-0000-0000-000000000000", "03000200-0400-0500-0006-000700080009"})
+		{
+			if (uuid == bad)
+			{
+				err = "product_uuid 不是每台独有的值（" + uuid + "），无法绑定本机";
+				return false;
+			}
+		}
+		return true;
+	}
+
 	static u64 hwid_hash8()
 	{
-		DWORD serial = 0;
-		GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0);
-		char name[MAX_COMPUTERNAME_LENGTH + 1] = {};
-		DWORD name_len = sizeof(name);
-		GetComputerNameA(name, &name_len);
-		char buf[64];
-		std::snprintf(buf, sizeof(buf), "%08lX-%s", static_cast<unsigned long>(serial), name);
+		std::string uuid, name, err;
+		if (!machine_fingerprint(uuid, name, err))
+		{
+			uuid = read_text_trimmed("/etc/machine-id");   // 仅用于报告/对账，不当绑定依据
+			if (uuid.empty()) uuid = "unknown";
+		}
+
+		static const u8 key[12] = {'d','i','m','g','-','h','w','i','d','-','v','1'};
 		u8 digest[32];
-		hash_sha256(buf, std::strlen(buf), digest);
+		hmac_sha256(key, sizeof(key), reinterpret_cast<const u8*>(uuid.data()), uuid.size(), digest);
+
 		u64 v = 0;
 		for (int i = 0; i < 8; i++) v = (v << 8) | digest[i];
 		return v;
 	}
+
+	// ---------------------------------------------------------------- 机器密钥文件（machine.key.enc）
+	static const u8 MK_MAGIC[8] = {'D','I','M','G','M','K','0','1'};
+	constexpr u64 MK_HDR = 8 + 4 + 16 + 4;          // magic | ver/flags/res | nonce(16) | ct_len(4)
+
+	static std::string machine_key_path()
+	{
+		return config_dir() + "machine.key.enc";
+	}
+
+	static void fingerprint_ikm(const std::string& uuid, const std::string& name, u8 ikm[32])
+	{
+		std::string msg = uuid;
+		msg.push_back('\0');
+		msg += name;
+
+		static const u8 key[12] = {'d','i','m','g','-','u','u','i','d','-','v','1'};
+		hmac_sha256(key, sizeof(key), reinterpret_cast<const u8*>(msg.data()), msg.size(), ikm);
+	}
+
+	static void derive_machine_keys(const u8 ikm[32], u8 kek[32], u8 mac_key[32])
+	{
+		static const u8 salt[10]  = {'d','i','m','g','-','m','k','-','v','1'};
+		static const u8 i_kek[11] = {'m','a','c','h','i','n','e','-','k','e','y'};
+		static const u8 i_mac[15] = {'m','a','c','h','i','n','e','-','k','e','y','-','m','a','c'};
+
+		hkdf_sha256(ikm, 32, salt, sizeof(salt), i_kek, sizeof(i_kek), kek, 32);
+		hkdf_sha256(ikm, 32, salt, sizeof(salt), i_mac, sizeof(i_mac), mac_key, 32);
+	}
+
+	static void aes_ctr(const u8 key[32], const u8 nonce[16], const void* in, void* out, usz len)
+	{
+		aes_context ctx;
+		aes_setkey_enc(&ctx, key, 256);
+
+		u8 counter[16];
+		std::memcpy(counter, nonce, 16);
+
+		usz nc_off = 0;
+		u8 stream_block[16] = {};
+		aes_crypt_ctr(&ctx, len, &nc_off, counter, stream_block,
+			static_cast<const u8*>(in), static_cast<u8*>(out));
+
+		secure_zero(&ctx, sizeof(ctx));
+		secure_zero(counter, sizeof(counter));
+		secure_zero(stream_block, sizeof(stream_block));
+	}
+
+	static EVP_PKEY* evp_from_der(const std::vector<u8>& der)
+	{
+		const unsigned char* p = der.data();
+		return d2i_AutoPrivateKey(nullptr, &p, static_cast<long>(der.size()));
+	}
+
+	static bool load_machine_key(machine_key& out, const u8 ikm[32], std::string& err)
+	{
+		std::vector<u8> blob;
+		if (!read_file_bytes(machine_key_path(), blob))
+		{
+			err = "没有机器密钥文件（" + machine_key_path() + "）";
+			return false;
+		}
+		if (blob.size() < MK_HDR + 32 || std::memcmp(blob.data(), MK_MAGIC, 8) != 0 || blob[8] != 1)
+		{
+			err = "机器密钥文件格式不符（" + machine_key_path() + "）";
+			return false;
+		}
+
+		const u32 ct_len = (u32(blob[28]) << 24) | (u32(blob[29]) << 16) | (u32(blob[30]) << 8) | u32(blob[31]);
+		if (blob.size() != MK_HDR + ct_len + 32)
+		{
+			err = "机器密钥文件长度不对";
+			return false;
+		}
+
+		u8 kek[32], mac_key[32];
+		derive_machine_keys(ikm, kek, mac_key);
+
+		u8 want[32];
+		hmac_sha256(mac_key, 32, blob.data(), MK_HDR + ct_len, want);
+		if (std::memcmp(want, blob.data() + MK_HDR + ct_len, 32) != 0)
+		{
+			err = "机器密钥打不开：不是这台机器的（指纹不符，可能拷了别的机器或换过主板）";
+			secure_zero(kek, sizeof(kek));
+			secure_zero(mac_key, sizeof(mac_key));
+			return false;
+		}
+
+		out.der.resize(ct_len);
+		aes_ctr(kek, blob.data() + 12, blob.data() + MK_HDR, out.der.data(), ct_len);
+		secure_zero(kek, sizeof(kek));
+		secure_zero(mac_key, sizeof(mac_key));
+
+		EVP_PKEY* pk = evp_from_der(out.der);
+		if (!pk)
+		{
+			err = "机器密钥内容无效";
+			out.der.clear();
+			return false;
+		}
+		const RSA* rsa = EVP_PKEY_get0_RSA(pk);
+		const BIGNUM* n = nullptr;
+		if (rsa)
+		{
+			RSA_get0_key(rsa, &n, nullptr, nullptr);
+		}
+		if (!n || BN_bn2binpad(n, out.modulus, RSA_BYTES) != RSA_BYTES)
+		{
+			EVP_PKEY_free(pk);
+			err = "机器公钥导出失败";
+			return false;
+		}
+		EVP_PKEY_free(pk);
+
+		out.valid = true;
+		out.used_tpm = false;
+		return true;
+	}
+
+	static bool store_machine_key(const std::vector<u8>& der, const u8 ikm[32], std::string& err)
+	{
+		u8 kek[32], mac_key[32];
+		derive_machine_keys(ikm, kek, mac_key);
+
+		u8 nonce[16] = {};
+		if (RAND_bytes(nonce, sizeof(nonce)) != 1)
+		{
+			err = "随机数源不可用";
+			return false;
+		}
+
+		const usz ct_len = der.size();
+		std::vector<u8> blob(MK_HDR + ct_len + 32);
+		std::memcpy(blob.data(), MK_MAGIC, 8);
+		blob[8] = 1;
+		std::memcpy(blob.data() + 12, nonce, 16);
+		blob[28] = static_cast<u8>((ct_len >> 24) & 0xFF);
+		blob[29] = static_cast<u8>((ct_len >> 16) & 0xFF);
+		blob[30] = static_cast<u8>((ct_len >> 8) & 0xFF);
+		blob[31] = static_cast<u8>(ct_len & 0xFF);
+
+		aes_ctr(kek, nonce, der.data(), blob.data() + MK_HDR, ct_len);
+		hmac_sha256(mac_key, 32, blob.data(), MK_HDR + ct_len, blob.data() + MK_HDR + ct_len);
+
+		secure_zero(kek, sizeof(kek));
+		secure_zero(mac_key, sizeof(mac_key));
+		secure_zero(nonce, sizeof(nonce));
+
+		return write_file_bytes(machine_key_path(), blob.data(), blob.size(), err);
+	}
+
+	static bool machine_key_open(machine_key& out, bool create, std::string& err)
+	{
+		if (out.valid)
+		{
+			return true;
+		}
+
+		std::string uuid, name, ferr;
+		if (!machine_fingerprint(uuid, name, ferr))
+		{
+			err = ferr;
+			return false;
+		}
+
+		u8 ikm[32];
+		fingerprint_ikm(uuid, name, ikm);
+
+		if (load_machine_key(out, ikm, err))
+		{
+			secure_zero(ikm, sizeof(ikm));
+			return true;
+		}
+
+		if (file_exists(machine_key_path()))
+		{
+			// 存在但打不开：绝不静默重建（那等于无声换机），交给人决定 --reset-key
+			err += "（可用 --reset-key 重建，但那会让已发出的 license 失效）";
+			secure_zero(ikm, sizeof(ikm));
+			return false;
+		}
+
+		if (!create)
+		{
+			secure_zero(ikm, sizeof(ikm));
+			return false;
+		}
+
+		std::vector<u8> der;
+		{
+			RSA* rsa = RSA_new();
+			BIGNUM* e = BN_new();
+			bool ok = rsa && e && BN_set_word(e, RSA_F4) == 1 && RSA_generate_key_ex(rsa, 2048, e, nullptr) == 1;
+			if (ok)
+			{
+				unsigned char* p = nullptr;
+				const int n = i2d_RSAPrivateKey(rsa, &p);
+				if (n > 0)
+				{
+					der.assign(p, p + n);
+				}
+				else
+				{
+					ok = false;
+				}
+				if (p)
+				{
+					OPENSSL_cleanse(p, static_cast<usz>(n > 0 ? n : 0));
+					OPENSSL_free(p);
+				}
+			}
+			if (rsa) RSA_free(rsa);
+			if (e) BN_free(e);
+
+			if (!ok)
+			{
+				err = "RSA-2048 生成失败";
+				secure_zero(ikm, sizeof(ikm));
+				return false;
+			}
+		}
+
+		const bool stored = store_machine_key(der, ikm, err);
+		secure_zero(ikm, sizeof(ikm));
+		if (!stored)
+		{
+			return false;
+		}
+
+		// 重新读回来（顺带验证文件真的能开）
+		u8 ikm2[32];
+		fingerprint_ikm(uuid, name, ikm2);
+		const bool reloaded = load_machine_key(out, ikm2, err);
+		secure_zero(ikm2, sizeof(ikm2));
+		return reloaded;
+	}
+
+	static bool machine_key_delete(std::string& note)
+	{
+		const std::string path = machine_key_path();
+		if (!file_exists(path))
+		{
+			note = "没有机器密钥文件";
+			return false;
+		}
+		if (::unlink(path.c_str()) != 0)
+		{
+			note = "删除失败：" + path;
+			return false;
+		}
+		note = "已删除 " + path;
+		return true;
+	}
+
+	// ---------------------------------------------------------------- RSA-OAEP（OpenSSL）
+	static bool rsa_oaep_decrypt(machine_key& mk, const u8* in, u8* out, u32& out_len)
+	{
+		if (!mk.valid || mk.der.empty())
+		{
+			return false;
+		}
+
+		EVP_PKEY* pk = evp_from_der(mk.der);
+		if (!pk)
+		{
+			return false;
+		}
+
+		bool ok = false;
+		EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pk, nullptr);
+		if (ctx && EVP_PKEY_decrypt_init(ctx) == 1 &&
+			EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1 &&
+			EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1 &&
+			EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1)
+		{
+			// OpenSSL 要求输出缓冲至少 RSA_size（256B），解完再裁到 BOX_PLAIN
+			u8 tmp[RSA_BYTES] = {};
+			usz n = sizeof(tmp);
+			if (EVP_PKEY_decrypt(ctx, tmp, &n, in, RSA_BYTES) == 1 && n == BOX_PLAIN)
+			{
+				std::memcpy(out, tmp, BOX_PLAIN);
+				out_len = BOX_PLAIN;
+				ok = true;
+			}
+			secure_zero(tmp, sizeof(tmp));
+		}
+		EVP_PKEY_CTX_free(ctx);
+		EVP_PKEY_free(pk);
+		return ok;
+	}
+
+	static bool ecdsa_p256_verify(const u8* hash32, const u8* sig64)
+	{
+		if (ISSUER_PUB_DECK[0] != 0x04)
+		{
+			return false;
+		}
+
+		EC_KEY* ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+		if (!ec)
+		{
+			return false;
+		}
+
+		// 公钥：65B uncompressed (0x04 || X || Y)
+		const EC_GROUP* group = EC_KEY_get0_group(ec);
+		EC_POINT* pt = EC_POINT_new(group);
+		BIGNUM* x = BN_bin2bn(ISSUER_PUB_DECK + 1, 32, nullptr);
+		BIGNUM* y = BN_bin2bn(ISSUER_PUB_DECK + 33, 32, nullptr);
+
+		bool ok = false;
+		if (pt && x && y &&
+			EC_POINT_set_affine_coordinates(group, pt, x, y, nullptr) == 1 &&
+			EC_KEY_set_public_key(ec, pt) == 1)
+		{
+			// 签名是 raw r||s（64B，和 Windows/CNG 侧同格式）；OpenSSL 的 EC API 要 ECDSA_SIG
+			ECDSA_SIG* sig = ECDSA_SIG_new();
+			BIGNUM* r = BN_bin2bn(sig64, 32, nullptr);
+			BIGNUM* ss = BN_bin2bn(sig64 + 32, 32, nullptr);
+			if (sig && r && ss)
+			{
+				// 3.x 起 ECDSA_SIG_set0 只存在于 1.1+；老版本用 ->r/->s 直接赋值
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+				ECDSA_SIG_set0(sig, r, ss);
+#else
+				sig->r = r;
+				sig->s = ss;
+#endif
+				ok = ECDSA_do_verify(hash32, 32, sig, ec) == 1;
+				ECDSA_SIG_free(sig);
+			}
+			else
+			{
+				BN_free(r);
+				BN_free(ss);
+				ECDSA_SIG_free(sig);
+			}
+		}
+
+		EC_POINT_free(pt);
+		BN_free(x);
+		BN_free(y);
+		EC_KEY_free(ec);
+		return ok;
+	}
+
+	// ---------------------------------------------------------------- 输出 / 报告
+	static std::string exe_dir()
+	{
+		char buf[4096] = {};
+		const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (n <= 0)
+		{
+			return {};
+		}
+		const std::string path(buf, static_cast<usz>(n));
+		const usz slash = path.find_last_of('/');
+		return slash == std::string::npos ? std::string(".") : path.substr(0, slash + 1);
+	}
+
+	// 写到配置目录（$HOME 持久；绝不写只读的 /usr 或 /etc）
+	static std::string write_text_file(const char* name, const std::string& utf8_text, std::string& status)
+	{
+		const std::string path = config_dir() + name;
+		std::string err;
+		if (!write_file_bytes(path, utf8_text.data(), utf8_text.size(), err))
+		{
+			status = err;
+			return {};
+		}
+		return path;
+	}
+
+	static void print_text(const std::string& utf8_text)
+	{
+		std::fputs(utf8_text.c_str(), stdout);
+		std::fflush(stdout);
+	}
+
+	static std::string machine_info_text()
+	{
+		std::string out = "=== 机器信息 ===\n";
+
+		char stamp[64] = {};
+		const std::time_t now = std::time(nullptr);
+		std::tm tmv{};
+		localtime_r(&now, &tmv);
+		std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+		out += std::string("报告时间     : ") + stamp + "\n";
+
+		char host[256] = {};
+		if (::gethostname(host, sizeof(host) - 1) == 0)
+		{
+			out += std::string("计算机名     : ") + host + "\n";
+		}
+
+		std::string os_name;
+		{
+			std::vector<u8> b;
+			if (read_file_bytes("/etc/os-release", b))
+			{
+				const std::string txt(b.begin(), b.end());
+				const usz p = txt.find("PRETTY_NAME=");
+				if (p != std::string::npos)
+				{
+					const usz e = txt.find('\n', p);
+					std::string v = txt.substr(p + 12, e == std::string::npos ? std::string::npos : e - p - 12);
+					for (char& c : v) if (c == '"' || c == '\'') c = ' ';
+					os_name = trim_copy(v);
+				}
+			}
+		}
+		if (!os_name.empty())
+		{
+			out += "操作系统     : " + os_name + "\n";
+		}
+
+		const std::string product = dmi_field("product_name");
+		if (!product.empty())
+		{
+			out += "机型         : " + product + "\n";
+		}
+
+		{
+			std::vector<u8> b;
+			if (read_file_bytes("/proc/cpuinfo", b))
+			{
+				const std::string txt(b.begin(), b.end());
+				const usz p = txt.find("model name");
+				if (p != std::string::npos)
+				{
+					const usz c = txt.find(':', p);
+					const usz e = txt.find('\n', c == std::string::npos ? p : c);
+					if (c != std::string::npos)
+					{
+						out += "处理器       : " + trim_copy(txt.substr(c + 1, e == std::string::npos ? std::string::npos : e - c - 1)) + "\n";
+					}
+				}
+			}
+		}
+
+		{
+			std::vector<u8> b;
+			if (read_file_bytes("/proc/meminfo", b))
+			{
+				const std::string txt(b.begin(), b.end());
+				const usz p = txt.find("MemTotal:");
+				const usz e = txt.find('\n', p);
+				if (p != std::string::npos && e != std::string::npos)
+				{
+					out += "物理内存     : " + trim_copy(txt.substr(p + 9, e - p - 9)) + "\n";
+				}
+			}
+		}
+
+		// 明文 UUID 只出现在 request.bin（出包侧本来就有 master.key，不算额外暴露）。
+		std::string uuid, name, ferr;
+		if (machine_fingerprint(uuid, name, ferr))
+		{
+			out += "设备 UUID    : " + uuid + "\n";
+		}
+		else
+		{
+			out += "设备 UUID    : （不可用：" + ferr + "）\n";
+		}
+
+		out += "程序目录     : " + exe_dir() + "\n";
+		out += "配置目录     : " + config_dir() + "\n";
+		return out;
+	}
+
+	static void add_be32(std::string& out, u32 v)
+	{
+		out += static_cast<char>((v >> 24) & 0xFF);
+		out += static_cast<char>((v >> 16) & 0xFF);
+		out += static_cast<char>((v >> 8) & 0xFF);
+		out += static_cast<char>(v & 0xFF);
+	}
+
+	static std::string deflate_zlib(const std::string& plain)
+	{
+		if (plain.empty() || plain.size() > 0x100000)
+		{
+			return {};
+		}
+
+		uLongf size = compressBound(static_cast<uLong>(plain.size()));
+		std::string out(size, '\0');
+		if (compress2(reinterpret_cast<Bytef*>(out.data()), &size,
+			reinterpret_cast<const Bytef*>(plain.data()), static_cast<uLong>(plain.size()), 9) != Z_OK)
+		{
+			return {};
+		}
+		out.resize(size);
+		return out;
+	}
+
+	std::string build_request_with_report(const u8* core, usz core_len, const std::string& report_utf8)
+	{
+		std::string blob(reinterpret_cast<const char*>(core), core_len);
+		const std::string packed = deflate_zlib(report_utf8);
+
+		if (packed.empty() || packed.size() > 0xFFFF)
+		{
+			return blob;   // 压缩不可用就只发 274 B：授权语义完全不变
+		}
+
+		u8 header_magic[4];
+		magic_put(header_magic, BUNDLE_MAGIC_MASKED, 4);
+
+		std::string head(reinterpret_cast<const char*>(header_magic), sizeof(header_magic));
+		head += static_cast<char>(1);   // version
+		head += static_cast<char>(1);   // method: 1 = zlib deflate
+		head += static_cast<char>(0);
+		head += static_cast<char>(0);
+		add_be32(head, static_cast<u32>(packed.size()));
+		add_be32(head, static_cast<u32>(report_utf8.size()));
+
+		const u16 crc = crc16(reinterpret_cast<const u8*>(head.data()), head.size());
+		head += static_cast<char>((crc >> 8) & 0xFF);
+		head += static_cast<char>(crc & 0xFF);
+
+		return blob + head + packed;
+	}
+
+#endif
 
 	// ---------------------------------------------------------------- license
 	struct license_info
@@ -710,7 +1433,21 @@ namespace dimg
 		}
 		out.push_back("license.bin");
 		out.push_back(config_dir() + "license.bin");
-		return out;
+		if (const char* home = std::getenv("HOME"))
+		{
+			// Flatpak 版 RPCS3 的配置目录（两个 RPCS3 并存的 Deck 上很常见）
+			out.push_back(std::string(home) + "/.var/app/net.rpcs3.RPCS3/config/rpcs3/dimg/license.bin");
+		}
+
+		std::vector<std::string> uniq;
+		for (const std::string& p : out)
+		{
+			if (std::find(uniq.begin(), uniq.end(), p) == uniq.end())
+			{
+				uniq.push_back(p);
+			}
+		}
+		return uniq;
 	}
 
 	static license_info parse_license(const std::vector<u8>& blob)
@@ -887,6 +1624,7 @@ namespace dimg
 	};
 
 	// ---------------------------------------------------------------- reports / machine info
+#ifdef _WIN32
 	static void add_be32(std::string& out, u32 v)
 	{
 		out += static_cast<char>((v >> 24) & 0xFF);
@@ -1088,6 +1826,82 @@ namespace dimg
 
 		return blob + head + packed;
 	}
+#else
+	// POSIX：与 Windows 同形的诊断文本（license/密钥定义都在上面了）
+	struct diagnose_result
+	{
+		std::string text;
+		bool active = false;
+		std::string reason;
+	};
+
+	static diagnose_result build_diagnose_text(machine_key& mk, bool have_key, const std::string& err)
+	{
+		diagnose_result res;
+		std::string& out = res.text;
+
+		addf(out, "=== 激活状态检查 ===\n\n");
+		if (have_key)
+		{
+			addf(out, "机器密钥     : 已存在\n");
+			addf(out, "密钥类型     : 软件密钥（指纹派生的 KEK 加密，%s）\n", machine_key_path().c_str());
+			addf(out, "公钥前 16 字节: ");
+			hex_into(out, mk.modulus, 16);
+			addf(out, "\n");
+		}
+		else
+		{
+			addf(out, "机器密钥     : 缺失（%s）\n", err.c_str());
+		}
+		addf(out, "平台档       : Steam Deck（tag[9] = %u）\n", unsigned(PROFILE_PLATFORM));
+		addf(out, "配置目录     : %s\n\n", config_dir().c_str());
+
+		for (const std::string& candidate : license_candidates(""))
+		{
+			fs::file lf(candidate);
+			if (!lf)
+			{
+				addf(out, "授权文件     : %s  （未找到）\n", candidate.c_str());
+				continue;
+			}
+
+			std::vector<u8> blob(lf.size());
+			lf.read(blob.data(), blob.size());
+			const license_info lic = parse_license(blob);
+			addf(out, "授权文件     : %s  -> %s\n", candidate.c_str(), lic.ok ? "签名有效 (valid signature)" : lic.error.c_str());
+
+			if (!lic.ok)
+			{
+				if (res.reason.empty()) res.reason = "授权文件无效：" + lic.error;
+				continue;
+			}
+
+			addf(out, "收件人编号   : ");
+			hex_into(out, lic.recipient, 16);
+			addf(out, "\n");
+
+			u8 k_iso[32];
+			u8 iv[16];
+			if (have_key && unseal_iso_keys(lic, mk, k_iso, iv))
+			{
+				secure_zero(k_iso, sizeof(k_iso));
+				secure_zero(iv, sizeof(iv));
+				res.active = true;
+				res.reason = "已安装授权，且与本机密钥匹配";
+			}
+			else if (res.reason.empty())
+			{
+				res.reason = have_key ? "授权文件与本机不匹配（不是这台机器的 license）" : "缺少机器密钥";
+			}
+		}
+
+		if (!res.active && res.reason.empty())
+		{
+			res.reason = "还没有安装授权文件";
+		}
+
+		return res;
+	}
 #endif
 
 	// ---------------------------------------------------------------- public API
@@ -1189,8 +2003,84 @@ namespace dimg
 		secure_zero(iv, sizeof(iv));
 		return out;
 #else
-		dimg_log.error("encrypted image requires a Windows build");
-		return fs::file{};
+		// POSIX（Steam Deck / Linux）：同一套流程，但机器密钥是「指纹派生 KEK 加密的软件密钥」。
+		dimg_log.notice("image layer: %s", path);
+
+		u8 tag[TAG_SIZE];
+		if (!read_exact(file, TAG_OFFSET, tag, sizeof(tag)))
+		{
+			dimg_log.error("image header unreadable: %s", path);
+			return fs::file{};
+		}
+
+		license_info lic;
+		for (const std::string& candidate : license_candidates(path))
+		{
+			fs::file lf(candidate);
+			if (!lf)
+			{
+				continue;
+			}
+
+			std::vector<u8> blob(lf.size());
+			if (lf.read(blob.data(), blob.size()) != blob.size())
+			{
+				continue;
+			}
+
+			lic = parse_license(blob);
+			if (lic.ok)
+			{
+				dimg_log.notice("activation data: %s", candidate);
+				break;
+			}
+			dimg_log.error("activation %s: %s", candidate, lic.error);
+		}
+
+		if (!lic.ok)
+		{
+			dimg_log.error("no activation data found (searched next to the image, the working dir, %s and the flatpak config dir) — "
+				"run rpcs3 --activate first", config_dir());
+			return fs::file{};
+		}
+
+		if (tag[9] != PROFILE_PLATFORM)
+		{
+			dimg_log.error("this image is not the Steam Deck build (E8: image platform %u, this build expects %u)",
+				unsigned(tag[9]), unsigned(PROFILE_PLATFORM));
+			return fs::file{};
+		}
+
+		if (std::memcmp(lic.tag.data(), tag, TAG_SIZE) != 0)
+		{
+			dimg_log.error("activation data does not match this image (E4)");
+			return fs::file{};
+		}
+
+		machine_key mk;
+		std::string err;
+		if (!machine_key_open(mk, false, err))
+		{
+			dimg_log.error("device key unavailable (E5): %s", err.c_str());
+			return fs::file{};
+		}
+
+		u8 k_iso[32];
+		u8 iv[16];
+		if (!unseal_iso_keys(lic, mk, k_iso, iv))
+		{
+			dimg_log.error("activation does not open on this device (E6, %s)", config_dir());
+			return fs::file{};
+		}
+
+		const u64 size = file.size();
+		dimg_log.notice("activation OK (%02x%02x%02x%02x…), decrypting on demand",
+			unsigned(lic.recipient[0]), unsigned(lic.recipient[1]), unsigned(lic.recipient[2]), unsigned(lic.recipient[3]));
+
+		fs::file out(std::unique_ptr<fs::file_base>(new lock_file(std::move(file), size, k_iso, iv)));
+		secure_zero(k_iso, sizeof(k_iso));
+		secure_zero(iv, sizeof(iv));
+		return out;
 #endif
 	}
 
@@ -1357,7 +2247,103 @@ namespace dimg
 		print_text(std::string("激活状态：") + (res.active ? "已激活" : "未激活") + "\n");
 		return true;
 #else
-		std::printf("image layer: not supported on this platform\n");
+		// POSIX：/bin/sh 下的激活 / 诊断 / 重置（不需要 .bat，输出直写配置目录）
+		if (!do_activate && !do_diagnose && !do_reset)
+		{
+			return false;
+		}
+
+		const std::string info = machine_info_text();
+
+		if (do_reset)
+		{
+			std::string note;
+			const bool gone = machine_key_delete(note);
+			print_text("机器密钥：" + note + "\n");
+			if (!gone)
+			{
+				dimg_log.error("reset: %s", note.c_str());
+				return true;
+			}
+			std::string wstat;
+			write_text_file("reset.txt", info + "\n重置完成：已删除机器密钥。请重新运行 --activate 并重新签发 license。\n", wstat);
+			return true;
+		}
+
+		machine_key mk;
+		std::string err;
+		const bool have_key = machine_key_open(mk, do_activate, err);
+
+		if (do_activate)
+		{
+			std::string body = "=== 第一步：生成申请码 ===\n\n";
+			if (!have_key)
+			{
+				addf(body, "生成机器密钥失败：%s\n", err.c_str());
+				std::string wstat;
+				write_text_file("activate.txt", info + "\n" + body, wstat);
+				print_text(body);
+				dimg_log.error("activate: %s", err.c_str());
+				return true;
+			}
+
+			const u64 hwid = hwid_hash8();
+			u8 core[REQ_LEN] = {};
+			magic_put(core, REQUEST_MAGIC_MASKED, sizeof(REQUEST_MAGIC_MASKED));
+			core[4] = static_cast<u8>(REQ_VER);
+			std::memcpy(core + 8, mk.modulus, RSA_BYTES);
+			for (int i = 0; i < 8; i++)
+			{
+				core[8 + RSA_BYTES + i] = static_cast<u8>((hwid >> ((7 - i) * 8)) & 0xFF);
+			}
+			const u16 crc = crc16(core, REQ_LEN - 2);
+			core[REQ_LEN - 2] = static_cast<u8>((crc >> 8) & 0xFF);
+			core[REQ_LEN - 1] = static_cast<u8>(crc & 0xFF);
+
+			const std::string blob = build_request_with_report(core, REQ_LEN, info + "\n" + body);
+			std::string werr;
+			const std::string req_path = config_dir() + "request.bin";
+			if (!write_file_bytes(req_path, blob.data(), blob.size(), werr))
+			{
+				addf(body, "写不进 %s：%s\n", req_path.c_str(), werr.c_str());
+				print_text(body);
+				return true;
+			}
+
+			const std::string code = base32_grouped(core, REQ_LEN);
+			std::string wstat;
+			write_text_file("code.txt", code + "\n", wstat);
+			write_text_file("activate.txt", info + "\n" + body +
+				"申请码文件   : " + req_path + "\n激活码       : " + code + "\n", wstat);
+
+			addf(body, "申请码文件   : %s（%u B）\n", req_path.c_str(), unsigned(blob.size()));
+			body += "激活码       : " + code + "\n";
+			body += "\n把这个文件（或上面这串）发给作者，拿到 license.bin 后放到：\n  " + config_dir() + "license.bin\n";
+			print_text(body);
+			dimg_log.notice("activation request written (%u B)", unsigned(blob.size()));
+			return true;
+		}
+
+		// --diag
+		const diagnose_result res = build_diagnose_text(mk, have_key, err);
+
+		std::string status_text;
+		addf(status_text, "status=%s\n", res.active ? "ACTIVE" : "INACTIVE");
+		addf(status_text, "激活状态：%s\n", res.active ? "已激活" : "未激活");
+		addf(status_text, "说明：%s\n", res.reason.c_str());
+		addf(status_text, "授权文件：%s\n", (config_dir() + "license.bin").c_str());
+
+		std::string wstat;
+		const std::string spath = write_text_file("status.txt", status_text, wstat);
+		const std::string dpath = write_text_file("diag.txt", info + "\n" + res.text, wstat);
+
+		dimg_log.notice("license status: %s (%s)", res.active ? "ACTIVE" : "INACTIVE", res.reason.c_str());
+
+		std::string shown = std::string("激活状态：") + (res.active ? "已激活" : "未激活") + "\n";
+		shown += "说明：" + res.reason + "\n";
+		if (!spath.empty()) shown += "状态文件：" + spath + "\n";
+		if (!dpath.empty()) shown += "详细报告：" + dpath + "\n";
+		print_text(shown);
 		return true;
 #endif
 	}

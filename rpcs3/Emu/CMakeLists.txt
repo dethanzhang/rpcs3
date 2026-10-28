@@ -728,6 +728,14 @@ if(APPLE)
     endif()
 endif()
 
+# Crypto/dimg.cpp 的 POSIX 分支（Steam Deck / Linux 的整盘加密镜像）只需要 libcrypto：
+#   RSA-OAEP(SHA-256) 解封 + ECDSA-P256 验签。AES-CTR 用仓库自带的 Crypto/aes.cpp。
+# Windows 侧走 CNG（bcrypt/ncrypt），不依赖它。
+if(NOT WIN32)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+    target_link_libraries(rpcs3_emu PRIVATE OpenSSL::Crypto)
+endif()
+
 
 if(USE_PRECOMPILED_HEADERS)
     target_precompile_headers(rpcs3_emu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../stdafx.h")

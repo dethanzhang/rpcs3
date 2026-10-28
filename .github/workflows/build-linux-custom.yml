@@ -1,0 +1,151 @@
+# =============================================================================
+# RPCS3 定制版 —— Linux（Steam Deck / SteamOS）构建
+# -----------------------------------------------------------------------------
+# 产物：一个 x86_64 AppImage（内含 dimg 的 POSIX 实现：整盘加密镜像 + 离线激活）
+# 用法：
+#   1. 在自己的 fork 里提交本文件
+#   2. Actions → "Build RPCS3 (custom Linux / Steam Deck)" → Run workflow
+#   3. 首次约 60~100 分钟；完了在 Artifacts 下载 AppImage + 源码包
+#
+# 与 build-windows-custom.yml 的区别：
+#   * 只在 Linux 上构建（SteamOS 是 Arch/x86_64，AppImage 直接用）
+#   * 用上游同一个 docker 镜像（rpcs3/rpcs3-ci-jammy:2.2）保证 glibc 不比 SteamOS 新
+#   * 额外装 libssl-dev：dimg 的 POSIX 分支用 libcrypto 做 RSA-OAEP 解封 + ECDSA 验签
+#   * 产出 AppImage（linuxdeploy 会把它依赖的 libcrypto 一起打进去）
+# =============================================================================
+
+name: Build RPCS3 (custom Linux / Steam Deck)
+
+defaults:
+  run:
+    shell: bash
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '本次构建备注（只写进 job summary，可留空）'
+        required: false
+        default: ''
+  push:
+    # 只在专用分支上触发；别写成 master，否则每次改 workflow 都会跑一遍
+    branches:
+      - custom-build
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_REPOSITORY_NAME: RPCS3/rpcs3
+  BUILD_SOURCEBRANCHNAME: master
+  BUILD_PR_NUMBER: ${{ github.event.pull_request.number }}
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_ARTIFACTSTAGINGDIRECTORY: ${{ github.workspace }}/artifacts/
+  # 上游脚本 .ci/*.sh 依赖这几个（见 .ci/docker.env）
+  APPDIR: "/rpcs3/build/appdir"
+  ARTDIR: "/root/artifacts"
+  RELEASE_MESSAGE: "/rpcs3/GitHubReleaseMessage.txt"
+  COMPILER: clang
+  DEPLOY_APPIMAGE: true
+  RUN_UNIT_TESTS: 'OFF'
+  # ccache（可选，命中能省 20~30 分钟）
+  CCACHE_DIR: ${{ github.workspace }}/ccache
+
+jobs:
+  Linux_Build:
+    name: RPCS3 Linux x86_64 (custom, AppImage)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      DOCKER_IMG: "rpcs3/rpcs3-ci-jammy:2.2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ env.COMPILER }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ env.COMPILER }}-
+
+      # 子模块必须在 git 工作树里（不进缓存）
+      - name: Fetch submodules
+        run: git submodule -q update --init --depth=1 --jobs=8
+
+      # docker 里跑上游构建脚本；先补 libssl-dev（dimg 的 POSIX 分支需要 libcrypto）
+      - name: Build in container
+        run: |
+          docker pull --quiet "${DOCKER_IMG}"
+          docker run --rm \
+            -v "$PWD:/rpcs3" \
+            --env-file .ci/docker.env \
+            -e CCACHE_DIR=/root/.ccache \
+            -v "${{ env.CCACHE_DIR }}:/root/.ccache" \
+            -v "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}:${ARTDIR}" \
+            "${DOCKER_IMG}" \
+            bash -lc '
+              set -e
+              if ! dpkg -s libssl-dev >/dev/null 2>&1; then
+                apt-get update -qq && apt-get install -y -qq libssl-dev
+              fi
+              pkg-config --modversion openssl
+              /rpcs3/.ci/build-linux.sh
+            '
+
+      - name: List artifacts
+        if: always()
+        run: |
+          mkdir -p "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          ls -l "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}" || true
+
+      # GPLv2 合规：二进制必须能拿到对应源码
+      - name: Package corresponding source (GPLv2)
+        run: |
+          OUT="${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          APP=$(ls "$OUT"/*.AppImage 2>/dev/null | head -1 || true)
+          BASE=$(basename "${APP:-rpcs3-custom}" .AppImage)
+          PREFIX="${BASE}-src"
+          git archive --format=tar.gz --prefix="${PREFIX}/" -o "${OUT}/${BASE}-src.tar.gz" HEAD
+          git submodule status > "${OUT}/${BASE}-SUBMODULES.txt"
+          git log -1 --format='commit=%H%nsubject=%s%ndate=%ad' > "${OUT}/${BASE}-COMMIT.txt"
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git fetch --no-tags --depth=1 upstream master || true
+            git diff upstream/master...HEAD > "${OUT}/${BASE}.patch" || true
+          fi
+
+      - name: Write SHA256SUMS
+        run: |
+          cd "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}"
+          sha256sum ./* > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### RPCS3 定制 Linux / Steam Deck 构建"
+            echo ""
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- 备注: ${{ github.event.inputs.note }}"
+            echo ""
+            echo '```'
+            cat "${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}/SHA256SUMS.txt" 2>/dev/null || echo '(无产物)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: RPCS3-Linux-custom-${{ github.run_number }}
+          path: ${{ env.BUILD_ARTIFACTSTAGINGDIRECTORY }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
