@@ -1956,7 +1956,7 @@ namespace dimg
 		if (!lic.ok)
 		{
 			dimg_log.error("no activation data found (searched next to the image, the working dir and %s) — "
-				"run rpcs3z.exe --activate first", config_dir());
+				"run rpcs3.exe --activate first", config_dir());
 			return fs::file{};
 		}
 

@@ -219,7 +219,11 @@ void main_window::Init()
 	CreateConnects();
 
 	setMinimumSize(350, minimumSizeHint().height());    // seems fine on win 10
+	#ifdef _WIN32
+	setWindowTitle(QString::fromStdString("RPCS3 " + rpcs3::get_verbose_version()));
+#else
 	setWindowTitle(QString::fromStdString("RPCS3Z " + rpcs3::get_verbose_version()));
+#endif
 
 	Q_EMIT RequestGlobalStylesheetChange();
 	ConfigureGuiFromSettings();

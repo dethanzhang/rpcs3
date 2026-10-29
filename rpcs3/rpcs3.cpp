@@ -809,7 +809,11 @@ int run_rpcs3(int argc, char** argv)
 
 	QScopedPointer<QCoreApplication> app(create_application(qt_argv));
 	app->setApplicationVersion(QString::fromStdString(rpcs3::get_version().to_string()));
-	app->setApplicationName("RPCS3Z");
+	#ifdef _WIN32
+	app->setApplicationName("RPCS3");      // Windows 产物仍叫 rpcs3.exe，显示名保持一致
+#else
+	app->setApplicationName("RPCS3Z");     // Steam Deck / Linux 产物叫 rpcs3z，和官方 RPCS3 区分
+#endif
 	app->setOrganizationName("RPCS3");
 
 	// Command line args
