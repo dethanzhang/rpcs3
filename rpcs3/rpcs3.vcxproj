@@ -54,7 +54,7 @@
   <PropertyGroup>
     <OutDir>$(SolutionDir)bin\</OutDir>
     <IntDir>$(SolutionDir)build\tmp\$(ProjectName)-$(Configuration)-$(Platform)\</IntDir>
-    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">rpcs3</TargetName>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">rpcs3z</TargetName>
     <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">rpcs3d</TargetName>
     <IgnoreImportLibrary>true</IgnoreImportLibrary>
     <LibraryPath>$(SolutionDir)build\lib\$(Configuration)-$(Platform)\;$(UniversalCRT_LibraryPath_x64);$(LibraryPath)</LibraryPath>

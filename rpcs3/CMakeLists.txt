@@ -98,6 +98,8 @@ if (NOT ANDROID)
 
     # Build rpcs3 executable
     add_executable(rpcs3 WIN32 MACOSX_BUNDLE)
+    # 定制版：输出名改成 rpcs3z（避免和玩家自装的官方 RPCS3 撞名、撞配置目录）
+    set_target_properties(rpcs3 PROPERTIES OUTPUT_NAME rpcs3z)
     if(WIN32)
         target_sources(rpcs3 PRIVATE rpcs3.rc)
         target_compile_definitions(rpcs3 PRIVATE UNICODE _UNICODE)
@@ -162,11 +164,11 @@ if (NOT ANDROID)
             DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/metainfo)
         # Install other files
         install(DIRECTORY ../bin/Icons
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3)
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3z)
         install(DIRECTORY ../bin/GuiConfigs
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3)
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3z)
         install(DIRECTORY ../bin/test
-            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3)
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/rpcs3z)
     endif()
 endif()
 

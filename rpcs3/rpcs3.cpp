@@ -809,7 +809,7 @@ int run_rpcs3(int argc, char** argv)
 
 	QScopedPointer<QCoreApplication> app(create_application(qt_argv));
 	app->setApplicationVersion(QString::fromStdString(rpcs3::get_version().to_string()));
-	app->setApplicationName("RPCS3");
+	app->setApplicationName("RPCS3Z");
 	app->setOrganizationName("RPCS3");
 
 	// Command line args

@@ -2604,7 +2604,7 @@ const std::string& fs::get_resources_dir()
 #ifdef __APPLE__
 		return exe_dir + "../Resources/";
 #else
-		return exe_dir + "../share/rpcs3/";
+		return exe_dir + "../share/rpcs3z/";
 #endif
 
 	}();
@@ -2688,7 +2688,7 @@ const std::string& fs::get_config_dir([[maybe_unused]] bool get_config_subdirect
 		else // Just in case
 			dir = "./config";
 
-		dir += "/rpcs3/";
+		dir += "/rpcs3z/";
 
 		if (!create_path(dir))
 		{
@@ -2738,7 +2738,7 @@ const std::string& fs::get_cache_dir()
 		else // Just in case
 			dir = "./cache";
 
-		dir += "/rpcs3/";
+		dir += "/rpcs3z/";
 
 		if (!create_path(dir))
 		{
