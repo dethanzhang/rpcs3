@@ -821,54 +821,141 @@ namespace dimg
 	}
 
 	// ---------------------------------------------------------------- 机器指纹
-	static std::string dmi_field(const char* name)
-	{
-		return read_text_trimmed(std::string("/sys/class/dmi/id/") + name);
-	}
-
-	// 只用固件层、与系统盘/SD 卡无关的两项。UUID 全 0 或 AMI 默认值 → 不可用（E7）。
-	static bool machine_fingerprint(std::string& uuid, std::string& name, std::string& err)
+	static std::string path_root()
 	{
 #ifdef DIMG_SELFTEST_FINGERPRINT
-		// 只有 tools/deck_port 的离线自测会定义这个宏；正式构建里不存在，避免变成绕过指纹的开关
-		if (const char* u = std::getenv("DIMG_TEST_UUID"))
+		// 只有 tools/deck_port 的离线自测会定义这个宏，用来把 /sys、/etc 指到假根目录
+		if (const char* r = std::getenv("DIMG_TEST_SYSROOT"))
 		{
-			uuid = u;
-			name = std::getenv("DIMG_TEST_PRODUCT") ? std::getenv("DIMG_TEST_PRODUCT") : "Jupiter";
-			return true;
+			return r;
 		}
 #endif
-		uuid = dmi_field("product_uuid");
-		name = dmi_field("product_name");
+		return {};
+	}
 
-		if (uuid.size() != 36)
+	static std::string dmi_field(const char* name)
+	{
+		return read_text_trimmed(path_root() + std::string("/sys/class/dmi/id/") + name);
+	}
+
+	// 机器标识候选（按优先级）。不同机器暴露的东西不一样：Steam Deck 常常没有 product_uuid
+	// （SMBIOS type-1 字符串为空时内核干脆不建这个文件），但一定有 /etc/machine-id。
+	// 指纹只用于派生 KEK，用哪个都行 —— 越靠前越好。
+	struct fp_candidate
+	{
+		std::string value;
+		std::string name;    // product_name，放进 ikm 当盐
+		std::string source;  // 给人看的来源说明
+	};
+
+	static std::string read_or_create_install_id()
+	{
+		const std::string path = config_dir() + "machine-id.txt";
+		const std::string v = read_text_trimmed(path);
+		if (!v.empty())
 		{
-			err = "读不到 /sys/class/dmi/id/product_uuid（需要 BIOS 暴露 SMBIOS UUID）";
-			return false;
+			return v;
 		}
-		for (const char* bad : {"00000000-0000-0000-0000-000000000000", "03000200-0400-0500-0006-000700080009"})
+
+		u8 rnd[16] = {};
+		if (RAND_bytes(rnd, sizeof(rnd)) != 1)
 		{
-			if (uuid == bad)
+			return {};
+		}
+
+		char buf[3];
+		std::string hex;
+		for (const u8 c : rnd)
+		{
+			std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(c));
+			hex += buf;
+		}
+
+		std::string err;
+		if (!write_file_bytes(path, hex.data(), hex.size(), err))
+		{
+			return {};
+		}
+		return hex;
+	}
+
+	static std::vector<fp_candidate> fingerprint_candidates()
+	{
+		std::vector<fp_candidate> out;
+
+#ifdef DIMG_SELFTEST_FINGERPRINT
+		// 只有 tools/deck_port 的离线自测会定义这个宏；正式构建里不存在
+		if (const char* u = std::getenv("DIMG_TEST_UUID"))
+		{
+			out.push_back({u, std::getenv("DIMG_TEST_PRODUCT") ? std::getenv("DIMG_TEST_PRODUCT") : "Jupiter", "selftest"});
+			return out;
+		}
+#endif
+
+		const std::string pname = dmi_field("product_name");
+
+		const auto add = [&](const char* source, const std::string& raw)
+		{
+			const std::string v = trim_copy(raw);
+			if (v.size() < 8)
 			{
-				err = "product_uuid 不是每台独有的值（" + uuid + "），无法绑定本机";
-				return false;
+				return;
 			}
+			for (const char* bad : {"00000000-0000-0000-0000-000000000000",
+				"03000200-0400-0500-0006-000700080009", "Not Specified", "To be filled by O.E.M.",
+				"Default string", "System Serial Number", "None"})
+			{
+				if (v == bad)
+				{
+					return;
+				}
+			}
+			for (const fp_candidate& c : out)
+			{
+				if (c.value == v)
+				{
+					return;   // 去重（product_serial 与 board_serial 常常一样）
+				}
+			}
+			out.push_back({v, pname, source});
+		};
+
+		add("dmi:product_uuid", dmi_field("product_uuid"));
+		add("dmi:board_serial", dmi_field("board_serial"));
+		add("dmi:product_serial", dmi_field("product_serial"));
+		add("os:machine-id", read_text_trimmed(path_root() + "/etc/machine-id"));
+		add("os:install-id", read_or_create_install_id());   // 最后兜底：本机随机生成，存在配置目录
+
+		return out;
+	}
+
+	// 列进 activate.txt / diag.txt，排障用
+	static std::string fingerprint_report_text(const std::vector<fp_candidate>& cands, const std::string& used)
+	{
+		std::string out = "指纹来源     : ";
+		if (cands.empty())
+		{
+			return out + "（全部不可用！）\n";
 		}
-		return true;
+		out += (used.empty() ? cands.front().source : used) + "\n";
+		for (const fp_candidate& c : cands)
+		{
+			addf(out, "               %-18s %s\n", (c.source + ":").c_str(), c.value.c_str());
+		}
+		return out;
 	}
 
 	static u64 hwid_hash8()
 	{
-		std::string uuid, name, err;
-		if (!machine_fingerprint(uuid, name, err))
+		std::string anchor = "unknown";
+		if (const std::vector<fp_candidate> cands = fingerprint_candidates(); !cands.empty())
 		{
-			uuid = read_text_trimmed("/etc/machine-id");   // 仅用于报告/对账，不当绑定依据
-			if (uuid.empty()) uuid = "unknown";
+			anchor = cands.front().value;
 		}
 
 		static const u8 key[12] = {'d','i','m','g','-','h','w','i','d','-','v','1'};
 		u8 digest[32];
-		hmac_sha256(key, sizeof(key), reinterpret_cast<const u8*>(uuid.data()), uuid.size(), digest);
+		hmac_sha256(key, sizeof(key), reinterpret_cast<const u8*>(anchor.data()), anchor.size(), digest);
 
 		u64 v = 0;
 		for (int i = 0; i < 8; i++) v = (v << 8) | digest[i];
@@ -1032,35 +1119,51 @@ namespace dimg
 			return true;
 		}
 
-		std::string uuid, name, ferr;
-		if (!machine_fingerprint(uuid, name, ferr))
+		const std::vector<fp_candidate> cands = fingerprint_candidates();
+		if (cands.empty())
 		{
-			err = ferr;
+			err = "读不到任何机器标识（product_uuid / 板载串号 / /etc/machine-id 全不可用）";
 			return false;
 		}
 
-		u8 ikm[32];
-		fingerprint_ikm(uuid, name, ikm);
-
-		if (load_machine_key(out, ikm, err))
-		{
-			secure_zero(ikm, sizeof(ikm));
-			return true;
-		}
-
+		// ① 已有密钥文件：逐个候选试着开（内核更新或锚点变化后能自愈，不必重新激活）
 		if (file_exists(machine_key_path()))
 		{
-			// 存在但打不开：绝不静默重建（那等于无声换机），交给人决定 --reset-key
-			err += "（可用 --reset-key 重建，但那会让已发出的 license 失效）";
-			secure_zero(ikm, sizeof(ikm));
+			std::string last;
+			for (const fp_candidate& c : cands)
+			{
+				u8 ikm[32];
+				fingerprint_ikm(c.value, c.name, ikm);
+
+				machine_key probe;
+				const bool ok = load_machine_key(probe, ikm, last);
+				secure_zero(ikm, sizeof(ikm));
+
+				if (ok)
+				{
+					out = std::move(probe);
+					out.note = c.source;
+					return true;
+				}
+			}
+
+			std::string tried;
+			for (const fp_candidate& c : cands)
+			{
+				tried += (tried.empty() ? "" : " / ") + c.source;
+			}
+			err = last + "（已按顺序试过：" + tried + "）；可用 --reset-key 重建，但那会让已发出的 license 失效";
 			return false;
 		}
 
 		if (!create)
 		{
-			secure_zero(ikm, sizeof(ikm));
+			err = "没有机器密钥文件（" + machine_key_path() + "），请先做激活（--activate）";
 			return false;
 		}
+
+		// ② 新建：用优先级最高的候选（有 product_uuid 就用它，没有就退到 machine-id 等）
+		const fp_candidate& best = cands.front();
 
 		std::vector<u8> der;
 		{
@@ -1069,20 +1172,20 @@ namespace dimg
 			bool ok = rsa && e && BN_set_word(e, RSA_F4) == 1 && RSA_generate_key_ex(rsa, 2048, e, nullptr) == 1;
 			if (ok)
 			{
-				unsigned char* p = nullptr;
-				const int n = i2d_RSAPrivateKey(rsa, &p);
+				unsigned char* q = nullptr;
+				const int n = i2d_RSAPrivateKey(rsa, &q);
 				if (n > 0)
 				{
-					der.assign(p, p + n);
+					der.assign(q, q + n);
 				}
 				else
 				{
 					ok = false;
 				}
-				if (p)
+				if (q)
 				{
-					OPENSSL_cleanse(p, static_cast<usz>(n > 0 ? n : 0));
-					OPENSSL_free(p);
+					OPENSSL_cleanse(q, static_cast<usz>(n > 0 ? n : 0));
+					OPENSSL_free(q);
 				}
 			}
 			if (rsa) RSA_free(rsa);
@@ -1091,11 +1194,12 @@ namespace dimg
 			if (!ok)
 			{
 				err = "RSA-2048 生成失败";
-				secure_zero(ikm, sizeof(ikm));
 				return false;
 			}
 		}
 
+		u8 ikm[32];
+		fingerprint_ikm(best.value, best.name, ikm);
 		const bool stored = store_machine_key(der, ikm, err);
 		secure_zero(ikm, sizeof(ikm));
 		if (!stored)
@@ -1103,11 +1207,11 @@ namespace dimg
 			return false;
 		}
 
-		// 重新读回来（顺带验证文件真的能开）
 		u8 ikm2[32];
-		fingerprint_ikm(uuid, name, ikm2);
+		fingerprint_ikm(best.value, best.name, ikm2);
 		const bool reloaded = load_machine_key(out, ikm2, err);
 		secure_zero(ikm2, sizeof(ikm2));
+		out.note = best.source;
 		return reloaded;
 	}
 
@@ -1329,16 +1433,8 @@ namespace dimg
 			}
 		}
 
-		// 明文 UUID 只出现在 request.bin（出包侧本来就有 master.key，不算额外暴露）。
-		std::string uuid, name, ferr;
-		if (machine_fingerprint(uuid, name, ferr))
-		{
-			out += "设备 UUID    : " + uuid + "\n";
-		}
-		else
-		{
-			out += "设备 UUID    : （不可用：" + ferr + "）\n";
-		}
+		// 明文标识只出现在 request.bin（出包侧本来就有 master.key，不算额外暴露）
+		out += fingerprint_report_text(fingerprint_candidates(), std::string{});
 
 		out += "程序目录     : " + exe_dir() + "\n";
 		out += "配置目录     : " + config_dir() + "\n";
@@ -1833,7 +1929,9 @@ namespace dimg
 		if (have_key)
 		{
 			addf(out, "机器密钥     : 已存在\n");
-			addf(out, "密钥类型     : 软件密钥（指纹派生的 KEK 加密，%s）\n", machine_key_path().c_str());
+			addf(out, "密钥类型     : 软件密钥（指纹派生的 KEK 加密）\n");
+			addf(out, "指纹来源     : %s\n", mk.note.empty() ? "未知" : mk.note.c_str());
+			addf(out, "密钥文件     : %s\n", machine_key_path().c_str());
 			addf(out, "公钥前 16 字节: ");
 			hex_into(out, mk.modulus, 16);
 			addf(out, "\n");
