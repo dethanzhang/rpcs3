@@ -36,6 +36,7 @@
 #include <openssl/rand.h>
 #include <openssl/x509.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <ctime>
 #include <cstdlib>
@@ -111,6 +112,14 @@ namespace dimg
 	constexpr u64 LIC_SIG_LEN  = 64;               // ECDSA P-256 raw r||s
 	constexpr u64 PUB_LEN      = 65;               // issuer pubkey, uncompressed
 	constexpr u64 REQ_LEN      = 4 + 4 + RSA_BYTES + 8 + 2;    // 274
+
+	// 平台档：编译期决定本二进制只认哪一个 tag[9]（0=Windows / 1=Steam Deck）。
+	// 它落在 km = tag[0:12] 里 ⇒ 参与 K_iso 派生 ⇒ 两档的盘与 license 彻底隔离。
+#if defined(_WIN32)
+	constexpr u8 PROFILE_PLATFORM = 0;
+#else
+	constexpr u8 PROFILE_PLATFORM = 1;
+#endif
 
 	#ifdef _WIN32
 	// Windows 档的 issuer 公钥（ECDSA P-256）。换签发密钥时同步改这里。
@@ -723,8 +732,7 @@ namespace dimg
 	// ⇒ 把 ~/.config/rpcs3/dimg/ 拷到另一台 Deck 解不开（指纹不同）。
 	// 注意：UUID 是公开信息，所以 **UUID 不进 machine.key.enc，也不进日志**（request.bin 例外）。
 
-	// 平台档：本二进制只认 Steam Deck 档（tag[9] == 1）
-	constexpr u8 PROFILE_PLATFORM = 1;
+	// 平台档：本二进制只认 Steam Deck 档（tag[9] == 1）；PROFILE_PLATFORM 在共享常量区定义。
 
 	// 前置声明：license 段在下面（两平台共用），这里的报告/诊断函数要引用
 	struct machine_key;
@@ -733,7 +741,7 @@ namespace dimg
 	static license_info parse_license(const std::vector<u8>& blob);
 	static bool unseal_iso_keys(const license_info& lic, machine_key& mk, u8 k_iso[32], u8 iv[16]);
 
-	// keys/issuer/deck/issuer.pub（65B，uncompressed P-256）；换签发密钥时同步改这里
+	// keys/deck/issuer.pub（65B，uncompressed P-256）；换签发密钥时同步改这里
 	static const u8 ISSUER_PUB_DECK[PUB_LEN] = {
 		0x04, 0x11, 0x9B, 0xAD, 0x11, 0x6C, 0x37, 0x82, 0xC3, 0x53, 0xD3, 0xBE, 0x86, 0xA5, 0x9C, 0xEB,
 		0xA0, 0xBD, 0x55, 0xD5, 0xB8, 0xE6, 0x31, 0x8F, 0xA3, 0x68, 0xA1, 0x02, 0xE1, 0xCE, 0x34, 0x3F,
@@ -1505,6 +1513,7 @@ namespace dimg
 		u8 hwid[8] = {};
 		u8 box[RSA_BYTES] = {};
 		std::vector<u8> tag;
+		std::string file;          // 从哪个 store/legacy 文件读出来的（日志/排查用）
 		std::string error;
 	};
 
@@ -1579,6 +1588,389 @@ namespace dimg
 		std::memcpy(iv, plain + 32, 16);
 		secure_zero(plain, sizeof(plain));
 		return true;
+	}
+
+	// ---------------------------------------------------------------- 多 license store
+	//
+	// <config>/dimg/licenses/<licid>.lic     licid = sha256(4096 B tag)[:16]（按内容算）
+	// 一次可以装多份（不同 tag 共存）；打开某张盘时按盘上的 tag 选对应那份。
+	// store 优先，legacy 单槽 license.bin（ISO 旁 / cwd / config / flatpak）作兜底。
+	static const char* platform_name(u8 p)
+	{
+		switch (p)
+		{
+		case 0: return "Windows";
+		case 1: return "Steam Deck";
+		case 2: return "Android";
+		default: return "未知";
+		}
+	}
+
+	static std::string licenses_dir()
+	{
+		const std::string dir = config_dir() + "licenses/";
+		fs::create_dir(dir);
+		return dir;
+	}
+
+	// 后缀比较（大小写不敏感：Windows 的 *.lic 本来就大小写不敏感，两边保持一致）
+	static bool ends_with_icase(const std::string& s, const char* suffix)
+	{
+		const usz n = std::strlen(suffix);
+		if (s.size() < n)
+		{
+			return false;
+		}
+		for (usz i = 0; i < n; i++)
+		{
+			char a = s[s.size() - n + i];
+			char b = suffix[i];
+			if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+			if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+			if (a != b)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// 枚举 store 里的 *.lic（排序）。.tmp 与其它后缀一律忽略。
+	static std::vector<std::string> list_store_files()
+	{
+		std::vector<std::string> out;
+		const std::string dir = licenses_dir();
+
+#ifdef _WIN32
+		// 必须用宽字符 API：exe 所在目录可能含中文/空格。
+		WIN32_FIND_DATAW fd{};
+		const std::wstring pattern = to_wide(dir) + L"*.lic";
+		HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+		if (h != INVALID_HANDLE_VALUE)
+		{
+			do
+			{
+				if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+				{
+					continue;
+				}
+				const std::string name = to_narrow(fd.cFileName);
+				if (!ends_with_icase(name, ".lic"))
+				{
+					continue;   // xxx.lic.tmp 自然被排除
+				}
+				out.push_back(dir + name);
+			}
+			while (FindNextFileW(h, &fd));
+			FindClose(h);
+		}
+#else
+		if (DIR* d = ::opendir(dir.c_str()))
+		{
+			while (const dirent* e = ::readdir(d))
+			{
+				const std::string name = e->d_name;
+				if (name == "." || name == "..")
+				{
+					continue;
+				}
+				if (!ends_with_icase(name, ".lic"))
+				{
+					continue;   // .tmp 忽略
+				}
+				out.push_back(dir + name);
+			}
+			::closedir(d);
+		}
+#endif
+
+		std::sort(out.begin(), out.end());
+		return out;
+	}
+
+	// store/legacy 文件读取：Windows 走 fs::file，POSIX 走 stdio（host 自测里 fs::file 是替身）。
+	static bool store_read_bytes(const std::string& path, std::vector<u8>& out)
+	{
+#ifdef _WIN32
+		fs::file f(path, fs::read);
+		if (!f)
+		{
+			return false;
+		}
+		out.resize(f.size());
+		return out.empty() || f.read(out.data(), out.size()) == out.size();
+#else
+		return read_file_bytes(path, out);
+#endif
+	}
+
+	static bool store_file_exists(const std::string& path)
+	{
+#ifdef _WIN32
+		return static_cast<bool>(fs::file(path));
+#else
+		return file_exists(path);
+#endif
+	}
+
+	// 先写 .tmp 再原子替换：中途崩掉不会留下半个 .lic。
+	static bool store_write_atomic(const std::string& path, const void* data, usz size, std::string& err)
+	{
+		const std::string tmp = path + ".tmp";
+
+#ifdef _WIN32
+		DWORD werr = 0;
+		if (!write_raw_file(to_wide(tmp), data, size, werr))
+		{
+			err = "写不进 " + tmp + "（Win32 error " + std::to_string(werr) + "）";
+			DeleteFileW(to_wide(tmp).c_str());
+			return false;
+		}
+		if (!MoveFileExW(to_wide(tmp).c_str(), to_wide(path).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		{
+			err = "落盘失败：无法把 " + tmp + " 改名为 " + path + "（Win32 error " + std::to_string(GetLastError()) + "）";
+			DeleteFileW(to_wide(tmp).c_str());
+			return false;
+		}
+		return true;
+#else
+		if (!write_file_bytes(tmp, data, size, err))
+		{
+			::unlink(tmp.c_str());
+			return false;
+		}
+		if (std::rename(tmp.c_str(), path.c_str()) != 0)
+		{
+			err = "落盘失败：无法把 " + tmp + " 改名为 " + path;
+			::unlink(tmp.c_str());
+			return false;
+		}
+		return true;
+#endif
+	}
+
+	static bool store_delete_file(const std::string& path)
+	{
+#ifdef _WIN32
+		return DeleteFileW(to_wide(path).c_str()) != 0;
+#else
+		return ::unlink(path.c_str()) == 0;
+#endif
+	}
+
+	// ---------------------------------------------------------------- 按 tag 选 license
+	//
+	// 旧逻辑是“第一个验签通过的 license 就用”，多 license 共存后这就是 bug：
+	// 装了 A、B 两张盘的授权，打开 B 时可能先摸到 A（验签通过）→ memcmp 失败（E4）。
+	// 现在的规则：**验签通过 && tag 4096B 全等 && 本机能开盒**，三者全过才接受。
+	struct license_pick
+	{
+		bool ok = false;
+		bool any_file = false;     // 至少有一份候选文件（store + legacy）
+		bool tag_match = false;    // 有验签通过且 tag 4096B 全等的候选
+		std::string code;          // E0(候选为空) / E1 / E2 / E4 / E5 / E6
+		std::string err;           // 给 UI/日志的中文说明
+	};
+
+	static int pick_rank(const std::string& code)
+	{
+		// 越具体越优先：能开盒失败(E6) > 没设备密钥(E5) > tag 不匹配(E4) > 验签失败(E2/E1)
+		if (code == "E6") return 6;
+		if (code == "E5") return 5;
+		if (code == "E4") return 4;
+		if (code == "E2") return 2;
+		if (code == "E1") return 1;
+		return 0;
+	}
+
+	static license_pick find_license_for_tag(const u8* tag4096, const std::string& image_path,
+		license_info& out, machine_key& mk, u8 k[32], u8 iv[16], bool have_key)
+	{
+		license_pick pick;
+		std::vector<std::string> files = list_store_files();
+
+		// legacy 兜底：ISO 旁 / cwd / config / flatpak，去重且只保留真实存在的。
+		for (const std::string& p : license_candidates(image_path))
+		{
+			if (std::find(files.begin(), files.end(), p) != files.end())
+			{
+				continue;
+			}
+			if (store_file_exists(p))
+			{
+				files.push_back(p);
+			}
+		}
+
+		pick.any_file = !files.empty();
+		pick.code = "E0";
+		pick.err = "还没有导入授权（store 与旧 license.bin 都是空）";
+
+		// 候选顺序：licenses/<licid>.lic（按盘的 tag 内容算出来的名字）→ 其余 store 文件 → legacy。
+		std::string preferred;
+		{
+			u8 digest[32];
+			hash_sha256(tag4096, TAG_SIZE, digest);
+			std::string id;
+			hex_into(id, digest, 8);   // sha256(tag)[:16] = 前 8 字节
+			preferred = licenses_dir() + id + ".lic";
+		}
+
+		std::vector<std::string> order;
+		if (std::find(files.begin(), files.end(), preferred) != files.end())
+		{
+			order.push_back(preferred);
+		}
+		for (const std::string& f : files)
+		{
+			if (f != preferred)
+			{
+				order.push_back(f);
+			}
+		}
+
+		std::string best_code;
+		std::string best_err;
+		int best_rank = -1;
+		const auto note = [&](const char* code, const std::string& msg)
+		{
+			const int rank = pick_rank(code);
+			if (rank > best_rank)
+			{
+				best_rank = rank;
+				best_code = code;
+				best_err = msg;
+			}
+		};
+
+		for (const std::string& path : order)
+		{
+			std::vector<u8> blob;
+			if (!store_read_bytes(path, blob))
+			{
+				note("E1", "读不到 " + path + "（E1）");
+				continue;
+			}
+
+			const license_info lic = parse_license(blob);
+			if (!lic.ok)
+			{
+				note("E2", path + "：" + lic.error);
+				continue;
+			}
+
+			if (lic.tag.size() != TAG_SIZE || std::memcmp(lic.tag.data(), tag4096, TAG_SIZE) != 0)
+			{
+				note("E4", "已安装的授权里没有这一款盘的（tag 不匹配，E4）");
+				continue;
+			}
+
+			pick.tag_match = true;
+
+			if (!have_key)
+			{
+				note("E5", "本机没有设备密钥（E5）：先做激活（--activate）");
+				continue;
+			}
+
+			if (!unseal_iso_keys(lic, mk, k, iv))
+			{
+				note("E6", "这份授权打不开（E6）：本机设备私钥解不开 license 里的密钥");
+				continue;
+			}
+
+			out = lic;
+			out.file = path;
+			pick.ok = true;
+			pick.code.clear();
+			pick.err.clear();
+			return pick;
+		}
+
+		pick.code = best_code.empty() ? "E0" : best_code;
+		pick.err = best_err.empty() ? pick.err : best_err;
+		return pick;
+	}
+
+	// 规范入口：验签 && tag 4096B 全等 && 本机能开盒，三者全过才返回 true。
+	static bool load_license_for_tag(const u8* tag4096, const std::string& image_path,
+		license_info& out, machine_key& mk, u8 k[32], u8 iv[16], bool have_key, std::string& err)
+	{
+		const license_pick pick = find_license_for_tag(tag4096, image_path, out, mk, k, iv, have_key);
+		err = pick.err;
+		return pick.ok;
+	}
+
+	// 列出 store（内部版：调用方已经开过设备密钥，避免重复开 CNG/指纹 KEK）
+	static std::vector<license_entry> list_licenses_impl(machine_key& mk, bool have_key)
+	{
+		std::vector<license_entry> out;
+
+		for (const std::string& path : list_store_files())
+		{
+			license_entry e;
+			e.file = path;
+
+			std::vector<u8> blob;
+			if (!store_read_bytes(path, blob))
+			{
+				e.error = "读不到这个文件（E1）";
+				out.push_back(std::move(e));
+				continue;
+			}
+
+			const license_info lic = parse_license(blob);
+			if (!lic.ok)
+			{
+				e.error = lic.error;
+				out.push_back(std::move(e));
+				continue;
+			}
+
+			e.signature_ok = true;
+			e.platform_code = lic.tag.size() > 9 ? lic.tag[9] : 0;
+			e.platform = platform_name(e.platform_code);
+			hex_into(e.recipient, lic.recipient, 16);
+			hex_into(e.hwid, lic.hwid, 8);
+
+			// licid / tag_sha256 都按**内容**算（文件名只是索引，用户可以手改/复制）
+			u8 digest[32];
+			hash_sha256(lic.tag.data(), lic.tag.size(), digest);
+			hex_into(e.tag_sha256, digest, 32);
+			hex_into(e.licid, digest, 8);
+
+			if (!have_key)
+			{
+				e.error = "没有设备密钥（E5）：先做激活（--activate）";
+				out.push_back(std::move(e));
+				continue;
+			}
+
+			u8 k_iso[32];
+			u8 iv[16];
+			e.opens_here = unseal_iso_keys(lic, mk, k_iso, iv);
+			secure_zero(k_iso, sizeof(k_iso));
+			secure_zero(iv, sizeof(iv));
+
+			if (!e.opens_here)
+			{
+				e.error = "这份授权打不开（E6）：本机设备私钥解不开 license 里的密钥";
+			}
+
+			out.push_back(std::move(e));
+		}
+
+		std::sort(out.begin(), out.end(), [](const license_entry& a, const license_entry& b)
+		{
+			return a.licid < b.licid;
+		});
+		return out;
+	}
+
+	// E5（缺设备密钥）与 E6（本机私钥解不开）原因不同，展示时分开写，免得用户以为要重签。
+	static bool license_missing_key(const license_entry& e)
+	{
+		return e.error.find("E5") != std::string::npos || e.error.find("没有设备密钥") != std::string::npos;
 	}
 
 	// ---------------------------------------------------------------- decrypting file
@@ -1875,6 +2267,46 @@ namespace dimg
 			}
 		}
 
+		// 多 license store：store + legacy 任一「本机可用」即 ACTIVE。
+		const std::vector<license_entry> store = list_licenses_impl(mk, have_key);
+		addf(out, "\n授权 store   : %s\n", licenses_dir().c_str());
+		if (store.empty())
+		{
+			addf(out, "  （store 为空；旧单槽：%slicense.bin）\n", config_dir().c_str());
+		}
+		else
+		{
+			usz usable = 0;
+			for (const license_entry& e : store)
+			{
+				const std::string state = e.opens_here ? "本机可用" : (e.signature_ok ? (license_missing_key(e) ? "没有设备密钥（E5）" : "打不开（E6）") : "签名无效");
+				addf(out, "  %s  %s  收件人 %s  %s", e.licid.c_str(), e.platform.c_str(), e.recipient.c_str(), state.c_str());
+				if (!e.error.empty())
+				{
+					addf(out, "  %s", e.error.c_str());
+				}
+				addf(out, "\n");
+				if (e.opens_here)
+				{
+					usable++;
+					res.active = true;
+					res.reason = "授权 store 里有本机可用的授权";
+				}
+			}
+			addf(out, "  共 %u 份（本机可用 %u 份）\n", unsigned(store.size()), unsigned(usable));
+			if (usable == 0 && res.reason.empty())
+			{
+				if (!have_key)
+				{
+					res.reason = "授权已导入，但本机缺少机器密钥（E5）";
+				}
+				else
+				{
+					res.reason = "已导入 " + std::to_string(store.size()) + " 份授权，但本机都打不开（E6）";
+				}
+			}
+		}
+
 		if (!res.active && res.reason.empty())
 		{
 			res.reason = "还没有安装授权文件";
@@ -1982,6 +2414,46 @@ namespace dimg
 			}
 		}
 
+		// 多 license store：store + legacy 任一「本机可用」即 ACTIVE。
+		const std::vector<license_entry> store = list_licenses_impl(mk, have_key);
+		addf(out, "\n授权 store   : %s\n", licenses_dir().c_str());
+		if (store.empty())
+		{
+			addf(out, "  （store 为空；旧单槽：%slicense.bin）\n", config_dir().c_str());
+		}
+		else
+		{
+			usz usable = 0;
+			for (const license_entry& e : store)
+			{
+				const std::string state = e.opens_here ? "本机可用" : (e.signature_ok ? (license_missing_key(e) ? "没有设备密钥（E5）" : "打不开（E6）") : "签名无效");
+				addf(out, "  %s  %s  收件人 %s  %s", e.licid.c_str(), e.platform.c_str(), e.recipient.c_str(), state.c_str());
+				if (!e.error.empty())
+				{
+					addf(out, "  %s", e.error.c_str());
+				}
+				addf(out, "\n");
+				if (e.opens_here)
+				{
+					usable++;
+					res.active = true;
+					res.reason = "授权 store 里有本机可用的授权";
+				}
+			}
+			addf(out, "  共 %u 份（本机可用 %u 份）\n", unsigned(store.size()), unsigned(usable));
+			if (usable == 0 && res.reason.empty())
+			{
+				if (!have_key)
+				{
+					res.reason = "授权已导入，但本机缺少机器密钥（E5）";
+				}
+				else
+				{
+					res.reason = "已导入 " + std::to_string(store.size()) + " 份授权，但本机都打不开（E6）";
+				}
+			}
+		}
+
 		if (!res.active && res.reason.empty())
 		{
 			res.reason = "还没有安装授权文件";
@@ -1992,6 +2464,83 @@ namespace dimg
 #endif
 
 	// ---------------------------------------------------------------- public API
+	// 导入授权：先看平台档（拿错档给 E8 人话）→ 验签 → 试开一次（拿得到 K_iso 才算数）→ 落 store。
+	// 落盘：<config>/dimg/licenses/<licid>.lic，同一 licid 覆盖写（先写 .tmp 再原子替换）。
+	bool import_license(const std::vector<u8>& blob, std::string& err)
+	{
+		// 平台档友好检查：blob 长度够时先看 tag[9]，别让“拿错档”的报错变成 E6。
+		if (blob.size() >= LIC_HDR_LEN + 10)
+		{
+			const u8 platform = blob[LIC_HDR_LEN + 9];
+			if (platform != PROFILE_PLATFORM)
+			{
+				err = std::string("这是 ") + platform_name(platform) + " 档的授权，本机是 "
+					+ platform_name(PROFILE_PLATFORM) + " 档（E8）";
+				return false;
+			}
+		}
+
+		const license_info lic = parse_license(blob);
+		if (!lic.ok)
+		{
+			err = lic.error;
+			return false;
+		}
+
+		machine_key mk;
+		if (!machine_key_open(mk, false, err))
+		{
+			err = "本机还没有设备密钥：先做激活（--activate）。" + err;
+			return false;
+		}
+
+		u8 k_iso[32];
+		u8 iv[16];
+		const bool opened = unseal_iso_keys(lic, mk, k_iso, iv);
+		secure_zero(k_iso, sizeof(k_iso));
+		secure_zero(iv, sizeof(iv));
+
+		if (!opened)
+		{
+			err = "这份授权不是发给本机的（E6）：换过机 / 重装过 / 换了安装包签名，需要重签一份";
+			return false;
+		}
+
+		// licid = sha256(4096B tag)[:16]（内容算）：同一张盘重签 → 同一个名字 → 覆盖旧授权
+		u8 digest[32];
+		hash_sha256(lic.tag.data(), lic.tag.size(), digest);
+		std::string licid;
+		hex_into(licid, digest, 8);
+
+		const std::string path = licenses_dir() + licid + ".lic";
+		if (!store_write_atomic(path, blob.data(), blob.size(), err))
+		{
+			return false;
+		}
+
+		dimg_log.notice("license imported (%u B) -> %s", unsigned(blob.size()), path.c_str());
+		return true;
+	}
+
+	bool import_license_file(const std::string& path, std::string& err)
+	{
+		std::vector<u8> blob;
+		if (!store_read_bytes(path, blob))
+		{
+			err = "读不到 " + path;
+			return false;
+		}
+		return import_license(blob, err);
+	}
+
+	std::vector<license_entry> list_licenses()
+	{
+		machine_key mk;
+		std::string err;
+		const bool have_key = machine_key_open(mk, false, err);
+		return list_licenses_impl(mk, have_key);
+	}
+
 	bool is_locked(fs::file& file)
 	{
 		if (!file)
@@ -2027,58 +2576,30 @@ namespace dimg
 			return fs::file{};
 		}
 
-		license_info lic;
-		for (const std::string& candidate : license_candidates(path))
+		if (tag[9] != PROFILE_PLATFORM)
 		{
-			fs::file lf(candidate);
-			if (!lf)
-			{
-				continue;
-			}
-
-			std::vector<u8> blob(lf.size());
-			if (lf.read(blob.data(), blob.size()) != blob.size())
-			{
-				continue;
-			}
-
-			lic = parse_license(blob);
-			if (lic.ok)
-			{
-				dimg_log.notice("activation data: %s", candidate);
-				break;
-			}
-			dimg_log.error("activation %s: %s", candidate, lic.error);
-		}
-
-		if (!lic.ok)
-		{
-			dimg_log.error("no activation data found (searched next to the image, the working dir and %s) — "
-				"run rpcs3.exe --activate first", config_dir());
-			return fs::file{};
-		}
-
-		if (std::memcmp(lic.tag.data(), tag, TAG_SIZE) != 0)
-		{
-			dimg_log.error("activation data does not match this image (E4)");
+			dimg_log.error("this image is not the Windows build (E8: image platform %u, this build expects %u)",
+				unsigned(tag[9]), unsigned(PROFILE_PLATFORM));
 			return fs::file{};
 		}
 
 		machine_key mk;
 		std::string err;
-		if (!machine_key_open(mk, false, err))
+		const bool have_key = machine_key_open(mk, false, err);
+
+		// 按盘上的 tag 选授权：验签 && tag 全等 && 本机能开盒（不再“第一个验签通过就用”）
+		license_info lic;
+		u8 k_iso[32];
+		u8 iv[16];
+		std::string pick_err;
+		if (!load_license_for_tag(tag, path, lic, mk, k_iso, iv, have_key, pick_err))
 		{
-			dimg_log.error("device key unavailable (E5): %s", err);
+			dimg_log.error("no usable license for this image (device key %s): %s — searched store %s and legacy license.bin",
+				have_key ? "present" : "missing (E5)", pick_err.c_str(), licenses_dir().c_str());
 			return fs::file{};
 		}
 
-		u8 k_iso[32];
-		u8 iv[16];
-		if (!unseal_iso_keys(lic, mk, k_iso, iv))
-		{
-			dimg_log.error("activation does not open on this device (E6, %s, %s)", config_dir(), mk.used_tpm ? "TPM" : "software KSP");
-			return fs::file{};
-		}
+		dimg_log.notice("activation data: %s", lic.file.c_str());
 
 		const u64 size = file.size();
 		dimg_log.notice("activation OK (%02x%02x%02x%02x…, %s), decrypting on demand",
@@ -2100,37 +2621,6 @@ namespace dimg
 			return fs::file{};
 		}
 
-		license_info lic;
-		for (const std::string& candidate : license_candidates(path))
-		{
-			fs::file lf(candidate);
-			if (!lf)
-			{
-				continue;
-			}
-
-			std::vector<u8> blob(lf.size());
-			if (lf.read(blob.data(), blob.size()) != blob.size())
-			{
-				continue;
-			}
-
-			lic = parse_license(blob);
-			if (lic.ok)
-			{
-				dimg_log.notice("activation data: %s", candidate);
-				break;
-			}
-			dimg_log.error("activation %s: %s", candidate, lic.error);
-		}
-
-		if (!lic.ok)
-		{
-			dimg_log.error("no activation data found (searched next to the image, the working dir, %s and the flatpak config dir) — "
-				"run rpcs3z --activate first", config_dir());
-			return fs::file{};
-		}
-
 		if (tag[9] != PROFILE_PLATFORM)
 		{
 			dimg_log.error("this image is not the Steam Deck build (E8: image platform %u, this build expects %u)",
@@ -2138,27 +2628,30 @@ namespace dimg
 			return fs::file{};
 		}
 
-		if (std::memcmp(lic.tag.data(), tag, TAG_SIZE) != 0)
-		{
-			dimg_log.error("activation data does not match this image (E4)");
-			return fs::file{};
-		}
-
 		machine_key mk;
 		std::string err;
-		if (!machine_key_open(mk, false, err))
+		const bool have_key = machine_key_open(mk, false, err);
+
+		// 按盘上的 tag 选授权：验签 && tag 全等 && 本机能开盒（不再“第一个验签通过就用”）
+		license_info lic;
+		u8 k_iso[32];
+		u8 iv[16];
+		std::string pick_err;
+		if (!load_license_for_tag(tag, path, lic, mk, k_iso, iv, have_key, pick_err))
 		{
-			dimg_log.error("device key unavailable (E5): %s", err.c_str());
+			if (!have_key)
+			{
+				dimg_log.error("device key unavailable (E5): %s", err.c_str());
+			}
+			else
+			{
+				dimg_log.error("no usable license for this image (searched store %s and legacy license.bin): %s",
+					licenses_dir().c_str(), pick_err.c_str());
+			}
 			return fs::file{};
 		}
 
-		u8 k_iso[32];
-		u8 iv[16];
-		if (!unseal_iso_keys(lic, mk, k_iso, iv))
-		{
-			dimg_log.error("activation does not open on this device (E6, %s)", config_dir());
-			return fs::file{};
-		}
+		dimg_log.notice("activation data: %s", lic.file.c_str());
 
 		const u64 size = file.size();
 		dimg_log.notice("activation OK (%02x%02x%02x%02x…), decrypting on demand",
@@ -2176,18 +2669,23 @@ namespace dimg
 		bool do_activate = false;
 		bool do_diagnose = false;
 		bool do_reset = false;
+		bool do_import = false;
+		bool do_list = false;
+		std::string import_path;
 
 		for (int i = 1; i < argc; i++)
 		{
 			const std::string arg = argv[i] ? argv[i] : "";
 
-			// Accept --activate / --diag / --reset-key (also -xxx, /xxx and bare xxx, any case).
+			// Accept --activate / --diag / --reset-key / --import-license / --list-licenses
+			// (also -xxx, /xxx and bare xxx, any case).
 			std::string key = arg;
 			while (!key.empty() && (key.front() == '-' || key.front() == '/'))
 			{
 				key.erase(key.begin());
 			}
-			for (char& c : key)
+			std::string lower = key;
+			for (char& c : lower)
 			{
 				if (c >= 'A' && c <= 'Z')
 				{
@@ -2195,23 +2693,152 @@ namespace dimg
 				}
 			}
 
-			if (key == "activate")
+			if (lower == "activate")
 			{
 				do_activate = true;
 			}
-			else if (key == "diag")
+			else if (lower == "diag")
 			{
 				do_diagnose = true;
 			}
-			else if (key == "reset-key")
+			else if (lower == "reset-key")
 			{
 				do_reset = true;
 			}
+			else if (lower == "import-license")
+			{
+				do_import = true;
+				if (i + 1 < argc)
+				{
+					import_path = argv[++i] ? argv[i] : "";
+				}
+			}
+			else if (lower.rfind("import-license=", 0) == 0)
+			{
+				// --import-license=<path>：path 保持大小写（key 是原串去掉前导 - /）
+				do_import = true;
+				import_path = key.substr(std::strlen("import-license="));
+			}
+			else if (lower == "list-licenses")
+			{
+				do_list = true;
+			}
 			else if (!arg.empty() && (arg[0] == '-' || arg[0] == '/') &&
-				(key.find("activ") != std::string::npos || key.find("diag") != std::string::npos))
+				(lower.find("activ") != std::string::npos || lower.find("diag") != std::string::npos))
 			{
 				dimg_log.error("unrecognized argument '%s' (expected --activate or --diag)", arg);
 			}
+		}
+
+		// 这两个命令不需要 activate/diag（也不动机器密钥）
+		if (do_import)
+		{
+			// 结果文件契约：每次执行都写 import.txt（首行 OK <licid> <platform> / FAIL <原因>），
+			// 这样 .bat 能 `findstr /b /c:"OK " import.txt` 判断，不依赖 GUI 子系统的 stdout。
+			// Windows 自动 GBK+CRLF 落到 exe 目录，POSIX 落到 config 目录。
+			auto write_import_result = [](const std::string& body)
+			{
+				std::string wstat;
+				write_text_file("import.txt", body, wstat);
+			};
+
+			if (import_path.empty())
+			{
+				print_text("FAIL 缺少授权文件路径（--import-license <file>）\n");
+				write_import_result("FAIL 缺少授权文件路径（--import-license <file>）\n"
+					"导入失败，见上面的原因。\n");
+				dimg_log.error("import license: missing file path");
+				return true;
+			}
+
+			std::string err;
+			if (!import_license_file(import_path, err))
+			{
+				print_text("FAIL " + err + "\n");
+
+				// FAIL 行必须单行（原因里的换行折成空格），否则 findstr 判断会错位
+				std::string reason;
+				for (const char c : err)
+				{
+					reason += (c == '\n' || c == '\r') ? ' ' : c;
+				}
+				write_import_result("FAIL " + reason + "\n"
+					"导入失败，见上面的原因。\n");
+
+				dimg_log.error("import license failed: %s", err.c_str());
+				return true;
+			}
+
+			// 输出契约：OK <licid> <platform>\n（bat 用 findstr /b /c:"OK " 判断）
+			std::string licid = "-";
+			std::string platform = "?";
+			std::vector<u8> blob;
+			if (store_read_bytes(import_path, blob))
+			{
+				const license_info lic = parse_license(blob);
+				if (lic.ok)
+				{
+					u8 digest[32];
+					hash_sha256(lic.tag.data(), lic.tag.size(), digest);
+					licid.clear();
+					hex_into(licid, digest, 8);
+					platform = platform_name(lic.tag.size() > 9 ? lic.tag[9] : 0);
+				}
+			}
+			print_text("OK " + licid + " " + platform + "\n");
+			write_import_result("OK " + licid + " " + platform + "\n"
+				"已导入：" + licid + "（" + platform + "）\n");
+			return true;
+		}
+
+		if (do_list)
+		{
+			const std::vector<license_entry> entries = list_licenses();
+			std::string text;
+			usz usable = 0;
+
+			for (const license_entry& e : entries)
+			{
+				if (e.opens_here)
+				{
+					usable++;
+				}
+
+				std::string state;
+				if (!e.signature_ok)
+				{
+					state = "签名无效";
+				}
+				else if (e.opens_here)
+				{
+					state = "本机可用";
+				}
+				else
+				{
+					state = license_missing_key(e) ? "没有设备密钥(E5)" : "打不开(E6)";
+				}
+
+				const std::string short_recipient = e.recipient.size() > 8 ? e.recipient.substr(0, 8) + "…" : e.recipient;
+				addf(text, "%s  %s  %s  %s", e.licid.c_str(), e.platform.c_str(), short_recipient.c_str(), state.c_str());
+				if (!e.error.empty())
+				{
+					addf(text, "  %s", e.error.c_str());
+				}
+				text += "\n";
+			}
+
+			addf(text, "共 %u 份授权（本机可用 %u 份）\n", unsigned(entries.size()), unsigned(usable));
+
+			// legacy 单槽不在 store 列表里，但 open 仍会兜底读取，单独补一句提示。
+			if (store_file_exists(config_dir() + "license.bin"))
+			{
+				text += "（另有旧单槽 license.bin：仍会被读取，但不在上面的 store 列表里）\n";
+			}
+
+			std::string status;
+			write_text_file("licenses.txt", text, status);
+			print_text(text);
+			return true;
 		}
 
 		if (!do_activate && !do_diagnose && !do_reset)
@@ -2241,6 +2868,28 @@ namespace dimg
 				{
 					reset_note += "\nremoved: " + path;
 				}
+			}
+
+			// 清空 store 下所有 *.lic（旧单槽 license.bin 已在 to_remove 里）
+			usz removed_licenses = 0;
+			for (const std::string& path : list_store_files())
+			{
+				if (store_delete_file(path))
+				{
+					removed_licenses++;
+				}
+				else
+				{
+					reset_note += "\n删不掉：" + path;
+				}
+			}
+			if (removed_licenses)
+			{
+				reset_note += "\n已清空授权 store（" + std::to_string(removed_licenses) + " 份）";
+			}
+			else
+			{
+				reset_note += "\n已清空授权 store（0 份）";
 			}
 
 			do_activate = true;   // regenerate a fresh request.bin right away
@@ -2297,7 +2946,8 @@ namespace dimg
 			}
 			addf(act, "密钥目录     : %s\n", config_dir().c_str());
 			addf(act, "激活码       :\n%s\n", code.c_str());
-			addf(act, "\n请把 request.bin 这个文件发给作者，作者会回给你 license.bin。\n");
+			addf(act, "\n请把 request.bin 这个文件发给作者，作者会回给你 .lic 文件。\n");
+			addf(act, "把作者发的 `.lic` 放到 exe 同目录，双击 `2-安装license.bat` 导入；旧的 `license.bin` 直接放本目录也仍可用。\n");
 
 			const std::string bundle = info + "\n" + act + "\n" + diag.text
 				+ "\n激活判定     : " + (diag.active ? "已激活" : "未激活") + "（" + diag.reason + "）\n";
@@ -2324,6 +2974,8 @@ namespace dimg
 		addf(status_text, "status=%s\n", res.active ? "ACTIVE" : "INACTIVE");
 		addf(status_text, "激活状态：%s\n", res.active ? "已激活" : "未激活");
 		addf(status_text, "说明：%s\n", res.reason.c_str());
+		addf(status_text, "授权 store：%s\n", licenses_dir().c_str());
+		addf(status_text, "旧单槽：%slicense.bin\n", config_dir().c_str());
 
 		std::string wstat;
 		write_text_file("status.txt", status_text, wstat);
@@ -2346,14 +2998,38 @@ namespace dimg
 		{
 			std::string note;
 			const bool gone = machine_key_delete(note);
-			print_text("机器密钥：" + note + "\n");
 			if (!gone)
 			{
 				dimg_log.error("reset: %s", note.c_str());
-				return true;
 			}
+
+			// 设备密钥没了，旧 license 必然失效：清空整个 store + 旧单槽，避免“有授权但打不开”。
+			usz removed = 0;
+			for (const std::string& path : list_store_files())
+			{
+				if (store_delete_file(path))
+				{
+					removed++;
+				}
+				else
+				{
+					note += "\n删不掉：" + path;
+				}
+			}
+
+			const std::string legacy = config_dir() + "license.bin";
+			const bool legacy_gone = store_delete_file(legacy);
+
+			std::string out = "机器密钥：" + note + "\n";
+			if (removed)
+			{
+				out += "已清空授权 store（" + std::to_string(removed) + " 份）\n";
+			}
+			out += std::string("旧单槽 license.bin：") + (legacy_gone ? "已删除\n" : "（不存在）\n");
+			print_text(out);
+
 			std::string wstat;
-			write_text_file("reset.txt", info + "\n重置完成：已删除机器密钥。请重新运行 --activate 并重新签发 license。\n", wstat);
+			write_text_file("reset.txt", info + "\n重置完成：已删除机器密钥与已导入的授权（store + 旧单槽）。请重新运行 --activate 并重新签发 license。\n", wstat);
 			return true;
 		}
 
@@ -2405,7 +3081,8 @@ namespace dimg
 
 			addf(body, "申请码文件   : %s（%u B）\n", req_path.c_str(), unsigned(blob.size()));
 			body += "激活码       : " + code + "\n";
-			body += "\n把这个文件（或上面这串）发给作者，拿到 license.bin 后放到：\n  " + config_dir() + "license.bin\n";
+			body += "\n把这个文件（或上面这串）发给作者，拿到 .lic 后放到程序目录，运行 P2 的安装脚本导入；\n";
+			body += "旧的 license.bin 放到下面这个位置也仍可用：\n  " + config_dir() + "license.bin\n";
 			print_text(body);
 			dimg_log.notice("activation request written (%u B)", unsigned(blob.size()));
 			return true;
@@ -2418,7 +3095,8 @@ namespace dimg
 		addf(status_text, "status=%s\n", res.active ? "ACTIVE" : "INACTIVE");
 		addf(status_text, "激活状态：%s\n", res.active ? "已激活" : "未激活");
 		addf(status_text, "说明：%s\n", res.reason.c_str());
-		addf(status_text, "授权文件：%s\n", (config_dir() + "license.bin").c_str());
+		addf(status_text, "授权 store：%s\n", licenses_dir().c_str());
+		addf(status_text, "旧单槽：%slicense.bin\n", config_dir().c_str());
 
 		std::string wstat;
 		const std::string spath = write_text_file("status.txt", status_text, wstat);
